@@ -1,0 +1,37 @@
+# ============================================================
+#  AI 录音卡 · 口语评测测试包 —— Python 依赖清单
+# ============================================================
+#  安装方式（推荐）：
+#      双击 安装依赖.bat
+#  或者手动：
+#      python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+#  要求 Python 3.11 或更高（本包在 3.13 上验证通过）。
+# ============================================================
+
+# ---- 微软 Azure 语音（发音评测 / 语音转文字）----
+azure-cognitiveservices-speech==1.51.2
+
+# ---- 讯飞 ISE（WebSocket 长连接）----
+websocket-client==1.9.2
+requests==2.34.2
+
+# ---- 音频采集与读写 ----
+sounddevice==0.5.6          # 麦克风录音
+soundfile==0.14.0           # 读写 wav
+numpy==2.5.3
+
+# ---- 音频对比（节奏 / 语调）与绘图 ----
+matplotlib==3.11.2
+
+# ---- 音素识别（音素对比）----
+# torch 用 CPU 版即可，体积小很多；装 GPU 版请自行换源。
+torch==2.14.0
+transformers==5.17.0
+huggingface-hub==1.31.0
+
+# 说明：
+#   1. torch 官方源在国内较慢，安装脚本里已单独指定 CPU 版索引，见 安装依赖.bat。
+#   2. 音素模型（约 1.2GB）不在本包内，首次运行 compare_phoneme.py 时自动下载。
+#   3. 不需要 phonemizer —— 脚本直接读模型的 vocab.json 做解码，避开了它
+#      （phonemizer 在 Windows 上还要额外装 espeak-ng，很麻烦）。
