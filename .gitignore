@@ -26,9 +26,19 @@ __pycache__/
 # HuggingFace 下载缓存（纯缓存，无保留价值）
 **/.cache/huggingface/
 
-# ---------- 4. 本地密钥配置（含 SecretKey，严禁提交） ----------
+# ---------- 4. 本地密钥配置（含密钥，严禁提交） ----------
+# 讯飞
 讯飞配置.json
 **/讯飞配置.json
+# Azure 语音服务
+azure配置.json
+**/azure配置.json
+Azure密钥.txt
+**/Azure密钥.txt
+*密钥*.txt
+# 通用兜底
+*.secret
+.env
 
 # ---------- 5. 音频素材（体积大，本地保留） ----------
 *.wav
