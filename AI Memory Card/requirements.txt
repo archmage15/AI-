@@ -2,10 +2,12 @@
 #  AI 录音卡 · 口语评测测试包 —— Python 依赖清单
 # ============================================================
 #  安装方式（推荐）：
-#      双击 安装依赖.bat
+#      双击 install_deps.bat
 #  或者手动：
-#      python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#      python -m pip install -r requirements.txt -i https://pypi.org/simple
 #
+#  注意：本清单锁定的是较新版本，清华镜像同步滞后、缺这些版本，
+#        必须用官方源 https://pypi.org/simple（否则报 from versions: none）。
 #  要求 Python 3.11 或更高（本包在 3.13 上验证通过）。
 # ============================================================
 

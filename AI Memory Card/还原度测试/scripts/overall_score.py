@@ -1,0 +1,294 @@
+# -*- coding: utf-8 -*-
+"""还原度对比 · 总装：综合评分 + 纠音报告
+
+把前两步的产物合起来算一个"综合还原度"：
+  ① 音素对比.json  → 发音分（音素替换）+ 音变分（缺音/多音）
+  ② 节奏对比.json  → 节奏分 + 语调分
+
+权重（用户定调：发音最重要，其余三项差不多）：
+  发音 40%  ｜  音变 20%  ｜  语调 20%  ｜  节奏 20%
+
+产出（两份，职责分开，都写在 output\\ 里）：
+  - 还原度综合评分.json   给机器/AI：各项分值 + 权重 + 明细
+  - 还原度综合报告.txt    给人看：综合分 + 分项分 + 问题清单 + 改进建议
+
+目录约定（本脚本在 scripts\\ 里，用 ROOT 指回上一层）：
+  audio\\   放录音     output\\  放结果（前两步写这里，本脚本从这里读）
+
+依赖：只用标准库（读 json、写 txt），不需要 torch —— 秒出结果。
+用法：先跑 音素对比 / 节奏对比（或直接双击 一键跑还原度.bat），再跑本脚本。
+"""
+import json
+import os
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+# ---- 目录约定 ----
+# 本脚本位于 <项目>\scripts\ 下，ROOT = 项目根（上一层）
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+OUT_DIR = os.path.join(ROOT, "output")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+PHONEME_JSON = os.path.join(OUT_DIR, "音素对比.json")
+RHYTHM_JSON = os.path.join(OUT_DIR, "节奏对比.json")
+OUT_JSON = os.path.join(OUT_DIR, "还原度综合评分.json")
+OUT_REPORT = os.path.join(OUT_DIR, "还原度综合报告.txt")
+
+# 四项权重（必须和为 1）
+WEIGHTS = {"发音": 0.40, "音变": 0.20, "语调": 0.20, "节奏": 0.20}
+
+
+def log(msg=""):
+    print(str(msg), flush=True)
+
+
+def read_json(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def score_pronunciation(stat):
+    """发音分：音素序列里"替换"越少越高。
+    替换 = 音读错了（θ→s 之类）—— 这是"发音"问题。
+    用均值口径：替换数同时占原/模仿音数的比例，取较宽松的一侧，避免长音串放大。"""
+    if not stat:
+        return None
+    ref_n = stat.get("原生音数") or 0
+    my_n = stat.get("模仿音数") or 0
+    rep = stat.get("替换音数") or 0
+    base = max(ref_n, my_n, 1)
+    return max(0.0, (1 - rep / base) * 100)
+
+
+def score_phoneme_change(stat):
+    """音变分：缺音（吞音/漏读）+ 多音（连读黏出来的多余音）越少越高。"""
+    if not stat:
+        return None
+    ref_n = stat.get("原生音数") or 0
+    my_n = stat.get("模仿音数") or 0
+    dele = stat.get("缺失音数") or 0
+    ins = stat.get("多余音数") or 0
+    base = max(ref_n, my_n, 1)
+    return max(0.0, (1 - (dele + ins) / base) * 100)
+
+
+def grade(score):
+    if score is None:
+        return "—"
+    if score >= 90:
+        return "优"
+    if score >= 80:
+        return "良"
+    if score >= 70:
+        return "中"
+    if score >= 60:
+        return "及格"
+    return "待加强"
+
+
+def build_advice(parts, phoneme, rhythm):
+    """根据分项分与明细生成"下一步怎么练"的建议。"""
+    tips = []
+    p, c, t, r = parts.get("发音"), parts.get("音变"), parts.get("语调"), parts.get("节奏")
+    lows = [k for k, v in [("发音", p), ("音变", c), ("语调", t), ("节奏", r)]
+            if v is not None and v < 70]
+    if not lows:
+        tips.append("四项都在 70 分以上，整体还原度不错，可以练更长、更快的句子。")
+    if p is not None and p < 75:
+        tips.append("发音是当前短板：对照报告里【替换】的音，逐个纠音（注意长短音、θ/ð、r/l）。")
+    if c is not None and c < 75:
+        tips.append("音变（连读/弱化/吞音）偏弱：留意原音频里被“吃掉”或黏连的音，先慢读再连读。")
+    if r is not None and r < 75:
+        tips.append("节奏偏弱：跟着原音频打拍子，注意停顿位置和每句的重音落点。")
+    if t is not None and t < 75:
+        tips.append("语调（音高起伏）偏弱：模仿原音频的升降调，疑问句尾音上扬、陈述句尾音下压。")
+    # 从停顿明细再补一条针对性提示
+    if rhythm:
+        ps = rhythm.get("停顿", {})
+        if ps.get("原音频处数") != ps.get("我的处数"):
+            tips.append("停顿数量与原音频不一致（原音频 %s 处 / 你 %s 处），"
+                        "注意不要多停或少停。" % (ps.get("原音频处数"), ps.get("我的处数")))
+    return tips
+
+
+def main():
+    log("=" * 62)
+    log("   还原度综合评分")
+    log("=" * 62)
+    log("")
+
+    phoneme = read_json(PHONEME_JSON)
+    rhythm = read_json(RHYTHM_JSON)
+    if phoneme is None:
+        log("X 缺少 音素对比.json —— 请先跑 compare_phoneme.py（或一键 bat）。")
+        return
+    if rhythm is None:
+        log("X 缺少 节奏对比.json —— 请先跑 compare_rhythm.py（或一键 bat）。")
+        return
+
+    stat = phoneme.get("对齐统计")
+    p_score = score_pronunciation(stat)
+    c_score = score_phoneme_change(stat)
+    r_score = rhythm.get("节奏分")
+    t_score = rhythm.get("语调分")
+    parts = {"发音": p_score, "音变": c_score, "语调": t_score, "节奏": r_score}
+
+    # 综合分：只有拿到的项按权重归一（缺项不参与，避免误判为 0）
+    avail = {k: v for k, v in parts.items() if v is not None}
+    wsum = sum(WEIGHTS[k] for k in avail)
+    overall = sum(WEIGHTS[k] * v for k, v in avail.items()) / wsum if wsum else 0.0
+
+    # ---- 终端简报 ----
+    log("综合还原度：%.1f / 100   （等级：%s）" % (overall, grade(overall)))
+    log("")
+    log("分项：")
+    for k in ("发音", "音变", "语调", "节奏"):
+        v = parts[k]
+        log("   %s  %s  / 100   (权重 %d%%)"
+            % (k, ("%.1f" % v) if v is not None else "  —",
+               int(WEIGHTS[k] * 100)))
+    log("")
+    log("明细参考：")
+    if stat:
+        log("   音素：替换 %d ｜ 缺失 %d ｜ 多余 %d ｜ 匹配 %d（原生共 %d 音）"
+            % (stat.get("替换音数", 0), stat.get("缺失音数", 0), stat.get("多余音数", 0),
+               stat.get("匹配音数", 0), stat.get("原生音数", 0)))
+    if rhythm:
+        sub = rhythm.get("子项分", {})
+        log("   节奏：时长 %s ｜ 停顿 %s ｜ 能量DTW %s"
+            % (sub.get("时长相似"), sub.get("停顿相似"), sub.get("能量DTW相似")))
+
+    # ---- 写 JSON（给机器）----
+    out = {
+        "综合还原度": round(overall, 1),
+        "等级": grade(overall),
+        "权重": WEIGHTS,
+        "分项分": {k: (round(v, 1) if v is not None else None) for k, v in parts.items()},
+        "音素明细": stat,
+        "节奏明细": rhythm,
+        "音素相似度(原始)": phoneme.get("相似度"),
+    }
+    try:
+        with open(OUT_JSON, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log("（写 json 失败：%s）" % e)
+
+    # ---- 写报告（给人）----
+    try:
+        write_report(overall, parts, phoneme, rhythm)
+    except Exception as e:
+        log("（写报告失败：%s）" % e)
+
+    log("")
+    log("数据（机器）：还原度综合评分.json")
+    log("报告（人看）：还原度综合报告.txt")
+
+
+def write_report(overall, parts, phoneme, rhythm):
+    L = []
+    L.append("=" * 60)
+    L.append("   还原度综合报告")
+    L.append("=" * 60)
+    L.append("")
+    L.append("原音频.wav  vs  模仿.wav（跟读还原度）")
+    L.append("")
+    L.append("综合还原度：%.1f / 100     等级：%s" % (overall, grade(overall)))
+    L.append("")
+    L.append("-" * 60)
+    L.append("一、分项得分（发音最重，其余持平）")
+    L.append("-" * 60)
+    for k in ("发音", "音变", "语调", "节奏"):
+        v = parts[k]
+        bar = "—" if v is None else "%.1f" % v
+        L.append("   %s  %6s / 100    权重 %d%%    %s"
+                 % (k, bar, int(WEIGHTS[k] * 100), grade(v) if v is not None else ""))
+    L.append("")
+
+    # 二、发音 / 音变问题（复用音素对比的问题清单）
+    L.append("-" * 60)
+    L.append("二、发音 / 音变问题（哪些音不像原音频）")
+    L.append("-" * 60)
+    diffs = phoneme.get("差异") or []
+    if diffs:
+        for d in diffs:
+            L.append("    " + d.strip())
+        L.append("")
+        L.append("    ※ [替换] 属发音问题；[缺音]/[多音] 属音变（连读/弱化/吞音）")
+    else:
+        L.append("    （音素序列完全一致，很棒）")
+    L.append("")
+    # 原句
+    words = phoneme.get("词表") or []
+    problem_words = set()
+    for d in diffs:
+        for seg in d.split("【"):
+            if "】" not in seg:
+                continue
+            inner = seg.split("】")[0]
+            # inner 形如：单词 "so"  或  单词 "Where" → "are" 之间
+            for q in inner.split('"')[1::2]:        # 取所有被双引号括起的词
+                w = q.strip()
+                if w:
+                    problem_words.add(w)
+    if words:
+        sent = " ".join(("【%s】" % w["word"]) if w["word"] in problem_words else w["word"]
+                       for w in words)
+        L.append("-" * 60)
+        L.append("三、原句（有问题的词已用【】框出）")
+        L.append("-" * 60)
+        L.append("    " + sent)
+        L.append("")
+
+    # 四、节奏 / 语调
+    L.append("-" * 60)
+    L.append("四、节奏 / 语调")
+    L.append("-" * 60)
+    if rhythm:
+        td = rhythm.get("总时长秒", {})
+        L.append("    时长：原音频 %.2fs   |   你 %.2fs   |   差 %+.2fs"
+                 % (td.get("原音频", 0), td.get("我的", 0), td.get("差", 0)))
+        al = rhythm.get("对齐", {})
+        L.append("    整体平移：%+.2fs（已自动对齐，不扣分）" % al.get("整体平移秒", 0))
+        ps = rhythm.get("停顿", {})
+        L.append("    停顿：原音频 %d 处  |  你 %d 处"
+                 % (ps.get("原音频处数", 0), ps.get("我的处数", 0)))
+        sub = rhythm.get("子项分", {})
+        L.append("    子项分：时长 %.1f ｜ 停顿 %.1f ｜ 能量DTW %.1f ｜ F0起伏 %.1f"
+                 % (sub.get("时长相似", 0), sub.get("停顿相似", 0),
+                    sub.get("能量DTW相似", 0), sub.get("F0起伏幅度", 0)))
+    L.append("")
+
+    # 五、改进建议
+    L.append("-" * 60)
+    L.append("五、下一步怎么练")
+    L.append("-" * 60)
+    for tip in build_advice(parts, phoneme, rhythm):
+        L.append("    · " + tip)
+    L.append("")
+
+    with open(OUT_REPORT, "w", encoding="utf-8") as f:
+        f.write("\n".join(L) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        import traceback
+        log("[致命错误]")
+        log(traceback.format_exc())
+    try:
+        input("按回车退出 ...")
+    except Exception:
+        pass

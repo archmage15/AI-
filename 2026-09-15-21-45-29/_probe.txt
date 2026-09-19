@@ -1,4 +1,0 @@
-﻿EXISTS 821395 bytes
----
-3.13.14 (main, Jun 11 2026, 04:04:46) [MSC v.1944 64 bit (AMD64)]
-

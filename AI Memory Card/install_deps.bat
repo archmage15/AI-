@@ -10,7 +10,7 @@ rem
 rem  What it does:
 rem    1. locate a Python (3.11+)
 rem    2. create an isolated .venv in this folder
-rem    3. install dependencies via Tsinghua mirror
+rem    3. install dependencies (torch from official PyPI)
 rem    4. self-check: can we import the key libraries
 rem
 rem  After this, every .bat in the kit auto-uses this .venv.
@@ -80,7 +80,11 @@ echo        OK
 echo.
 
 rem ---------- 3. install ----------
-set "MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple"
+rem All packages come from official PyPI. The Tsinghua mirror lags
+rem badly behind for this project: it lacks the pinned versions (e.g.
+rem torch 2.14.0, azure-speech 1.51.2, numpy 2.5.3 ...), so pip
+rem reports "from versions: none". Official PyPI has them all.
+set "MIRROR=https://pypi.org/simple"
 
 echo [3/4] upgrading pip ...
 "%VPY%" -m pip install --upgrade pip -i %MIRROR% --quiet
