@@ -80,6 +80,13 @@ XF_HOST = "https://raasr.xfyun.cn/v2/api"
 # wav2vec2 特征提取下采样步长 320 采样点 @16kHz -> 每帧 20ms
 FRAME_MS = 20
 
+# ---- 连读区判定 ----
+# 讯飞在连读处给的"词边界"本身不可靠：两个词黏成一团时，它会把整团划给前一个词，
+# 后一个词只剩几十毫秒的碎屑（实测 "are" 只有 30ms）。
+# 连读在语言上本来就是一整团、切不开的东西，所以这里不硬切，而是标成"连读区"。
+MIN_WORD_MS = 80        # 短于此长度的词，视为"碎片词"，可能与邻居构成连读
+MERGE_GAP_MS = 60       # 碎片词与邻居间隔小于此值才合并（FRAME_MS * 3）
+
 
 def log(msg=""):
     print(str(msg), flush=True)
@@ -336,7 +343,212 @@ def word_indices(idxs, words):
     return sorted({i for i in idxs if i is not None})
 
 
-def format_words(word_ids, words):
+# ---------------- 连读区识别（用讯飞词边界校正音素归词）----------------
+#
+# 为什么要有这一段：
+#   本地模型是 CTC 盲拆，没有"词"的概念。原来把每个音素按时间点塞进讯飞的词区间里，
+#   塞不进去的就甩给"最近的词"。在连读处（如 Where are），讯飞自己都把整团划给了
+#   Where，are 只剩 30ms 碎屑 —— 结果音素被整团错归给 Where，报告只能含糊写
+#   "Where → are 之间"。
+#
+#   这里的做法：先看讯飞给的词区间靠不靠谱。够宽的正常归词；太窄的判定为"碎片词"，
+#   与相邻词合成"连读区"，明确告诉学生"这里是一个连读，按整体看"——因为连读本来
+#   就切不开，硬切反而错。
+
+def build_word_spans(words, frame_times, total_ms):
+    """把讯飞的词表变成一段段稳定的区间，并统计每段里落了几个音素。
+
+    做三件修补，防止词表边界与音素时间对不上：
+      1) 首尾补边：第 0 个词之前、最后一个词之后若还有音素，也要有区间可归。
+      2) 单调修正：强制 start 严格递增，避免区间互相挤夹。
+      3) 容差命中：FRAME_MS 之内都算落在该词里（帧边界会抖）。
+    """
+    if not words:
+        return []
+
+    spans = []
+    for i, w in enumerate(words):
+        s = int(w.get("start_ms") or 0)
+        e = int(w.get("end_ms") or 0)
+        if e < s:
+            e = s
+        spans.append({"idx": i, "word": w["word"], "start_ms": s, "end_ms": e, "n_ph": 0})
+
+    # 1) 首尾补边：让整条时间轴都被覆盖，音素不会有"无主"的空白
+    if spans:
+        spans[0]["start_ms"] = 0
+        spans[-1]["end_ms"] = max(int(total_ms), spans[-1]["end_ms"])
+
+    # 2) 单调修正：start 必须严格递增
+    for i in range(1, len(spans)):
+        if spans[i]["start_ms"] <= spans[i - 1]["start_ms"]:
+            spans[i]["start_ms"] = spans[i - 1]["start_ms"] + 1
+        if spans[i]["start_ms"] >= spans[i]["end_ms"]:
+            spans[i]["end_ms"] = spans[i]["start_ms"] + 1
+
+    # 3) 容差命中的方式统计每个区间的音素数（用区间中点判，避免边界抖动）
+    for t in frame_times:
+        t = int(t)
+        for sp in spans:
+            lo = sp["start_ms"] - FRAME_MS
+            hi = sp["end_ms"] + FRAME_MS
+            if lo <= t <= hi:
+                sp["n_ph"] += 1
+                break
+
+    for sp in spans:
+        span_ms = sp["end_ms"] - sp["start_ms"]
+        sp["span_ms"] = span_ms
+        # 碎片词 = 时长过短（只按时长判，不看音素数）。
+        # 有些长词可能一个音都没分到（如感叹词 oh 在原音频里没被单独拆出音素），
+        # 那是识别粒度问题，不是连读，不该并进连读区。
+        sp["short"] = span_ms < MIN_WORD_MS
+
+    return spans
+
+
+def pair_fragments(spans):
+    """把"碎片词"和它的邻居并成"连读区"。
+
+    三条限制，都是为了防止"越并越大"：
+      1) 只并"时长过短"的碎片词（不看 n_ph —— 有些长词可能一个音都没分到，
+         那是别的问题，不是连读，不该并）。
+      2) 一个词一旦进了某个连读区，就不再作为下一轮的合并起点（防连锁传染）。
+      3) 连读区最多 2 个词 —— 真连读是"两个词黏在一起"，三个词整体糊成一团
+         不是典型连读，并进去只会让报告更糊。
+
+    返回 (主区间列表, 连读区列表, 区间下标 -> 连读区下标 映射)
+    """
+    if not spans:
+        return [], [], {}
+
+    zone_of = {}          # 主区间下标 -> 连读区下标
+    zones = []
+    consumed = set()      # 已被并进连读区、不再单独出现的主区间下标
+
+    for i, sp in enumerate(spans):
+        if not sp["short"] or i in consumed:
+            continue
+        prev_sp = spans[i - 1] if i > 0 else None
+        next_sp = spans[i + 1] if i + 1 < len(spans) else None
+
+        # 邻居是否"紧挨着"（判断连读的关键：够近才可能黏在一起）
+        prev_near = (prev_sp is not None and (i - 1) not in consumed
+                     and (sp["start_ms"] - prev_sp["end_ms"]) <= MERGE_GAP_MS)
+        next_near = (next_sp is not None and (i + 1) not in consumed
+                     and (next_sp["start_ms"] - sp["end_ms"]) <= MERGE_GAP_MS)
+
+        if prev_near:
+            # 优先朝前并（连读多是"前词拖住了后词"）
+            members = [i - 1, i]
+        elif next_near:
+            members = [i, i + 1]
+        else:
+            continue          # 孤立短词：不并，保持独立
+
+        if any(m in consumed for m in members):
+            continue
+
+        zi = len(zones)
+        for m in members:
+            consumed.add(m)
+            zone_of[m] = zi
+        zones.append({
+            "zone_idx": zi,
+            "member_idx": members,
+            "words": [spans[m]["word"] for m in members],
+            "start_ms": spans[members[0]]["start_ms"],
+            "end_ms": spans[members[-1]]["end_ms"],
+            "n_ph": sum(spans[m]["n_ph"] for m in members),
+            "why": " ".join(spans[m]["word"] for m in members),
+        })
+
+    main = [sp for i, sp in enumerate(spans) if i not in consumed]
+    return main, zones, zone_of
+
+
+def assign_word_owner(times_ms, spans, zones, main_map):
+    """音素时间点 -> 归属编码。
+
+    返回值 list，每项：
+      "zone:K"  → 落在第 K 个连读区（切不开，按整体看）
+      "word:W"  → 落在某个正常词（W 是词名）
+      None      → 没归属（降级用）
+
+    判定顺序很重要：**先正常词、后连读区**。
+    如果倒过来（连读区优先），连读区边界上的音素会把相邻正常词的音也吸进来
+    —— 实测发生过：so 的音 oʊ 被算进了 Where are 连读区。
+    """
+    out = []
+    for t in times_ms:
+        t = int(t)
+        hit = None
+        # 1) 先看是不是落在某个正常词的精确区间里（含一个帧的容差）
+        for sp in spans:
+            if (sp["start_ms"] - FRAME_MS) <= t <= (sp["end_ms"] + FRAME_MS):
+                hit = "word:%s" % sp["word"]
+                break
+        # 2) 正常词都没命中，才考虑连读区（不加容差，避免边界溢出）
+        if hit is None:
+            for z in zones:
+                if z["start_ms"] <= t <= z["end_ms"]:
+                    hit = "zone:%d" % z["zone_idx"]
+                    break
+        if hit is None:
+            for sp in spans:
+                if (sp["start_ms"] - FRAME_MS) <= t <= (sp["end_ms"] + FRAME_MS):
+                    hit = "word:%s" % sp["word"]
+                    break
+        if hit is None:
+            # 兜底：取最近的主区间（与旧逻辑同义，保证任何音素都有归属）
+            best, best_d = None, None
+            for sp in spans:
+                d = min(abs(t - sp["start_ms"]), abs(t - sp["end_ms"]))
+                if best_d is None or d < best_d:
+                    best, best_d = sp, d
+            if best is not None:
+                hit = "word:%s" % best["word"]
+        out.append(hit)
+    return out
+
+
+def collapse_owner(codes):
+    """把归属编码压成 (连读区名列表, 单词名列表)，保持首次出现顺序。"""
+    zones_seen, words_seen = [], []
+    for c in codes:
+        if not c:
+            continue
+        kind, _, name = c.partition(":")
+        if kind == "zone":
+            z = int(name)
+            if z not in zones_seen:
+                zones_seen.append(z)
+        elif kind == "word":
+            if name not in words_seen:
+                words_seen.append(name)
+    return zones_seen, words_seen
+
+
+def format_words(word_ids, words, zone_names=None):
+    """生成词标签，附在每条差异后面。
+
+    注意（这是一个隐式契约，不能破）：
+      overall_score.py 会反向解析本函数产出的字符串 —— 它把【】里的内容按双引号
+      切开、取奇数位当"问题词"。所以：
+        - 双引号必须成对
+        - 被双引号包住的必须是"单个词"，不能是 "Where are" 这种拼接串
+          （拼成一串的话，那边拿 "Where are" 去跟单个词 "Where" 比，一个都匹配不上）
+      连读区的两个词因此各自单独加引号：`"Where" "are"`，抠词得 ["Where","are"]。
+    """
+    if zone_names:
+        # 连读区：连读本来切不开，直接告诉学生"这里是一个连读"。
+        # 每个词单独加引号（而不是拼成一串放进一个引号里）—— 这样上游按
+        # split('"')[1::2] 抠词时，能分别拿到 "Where"、"are"，原句里两个词都能框出。
+        all_words = []
+        for nm in zone_names:
+            all_words.extend(nm.split(" "))
+        names = '" "'.join(all_words)
+        return "【连读区 \"%s\"】⚠ 这里是连读，按整体的读法看，不必拆开" % names
     if not words or not word_ids:
         return ""
     if len(word_ids) == 1:
@@ -406,7 +618,12 @@ def write_report(ref, mine, sm, words, ratio, diff_items, problem_words):
     L.append("-" * 60)
     if diff_items:
         for it in diff_items:
-            who = "、".join(it["words"]) if it["words"] else "（未定位到词）"
+            if it.get("zone_names"):
+                who = "、".join(it["zone_names"])          # 连读区：直接报词组
+            elif it["words"]:
+                who = "、".join(it["words"])
+            else:
+                who = "（未定位到词）"
             if it["kind"] == "替换":
                 L.append("    [替换] %s：应读 %s  →  实读 %s" % (who, it["ref"], it["my"]))
             elif it["kind"] == "缺失":
@@ -415,6 +632,9 @@ def write_report(ref, mine, sm, words, ratio, diff_items, problem_words):
                 L.append("    [多音] %s：多了 %s" % (who, it["my"]))
         L.append("")
         L.append("    ※ [缺音]/[多音] 多出现在连读、弱化、吞音处——这就是“音变”")
+        if any(it.get("zone") for it in diff_items):
+            L.append("    ※ 标了「连读区」的地方，是两个词黏在一起读（如 Where are），")
+            L.append("      连读本来就是一整团、切不开，按整体的读法练就好，不必拆单个音。")
     else:
         L.append("    （音素序列完全一致，很棒）")
     # 原句（问题词用【】框出）
@@ -482,7 +702,19 @@ def main():
         words = []
         log("   （跳过，只给音素级结果）：%s" % e)
 
-    ref_word_idx = assign_word_indices([f * FRAME_MS for f in frames_map["原音频"]], words)
+    # 音素时间轴（原音频侧）：帧号 × 20ms
+    ref_frame_times = [f * FRAME_MS for f in frames_map["原音频"]]
+    ref_word_idx = assign_word_indices(ref_frame_times, words)   # 旧路径，保留作降级
+
+    # 连读区识别：把讯飞词表变成稳定区间，碎片词与邻居并成"连读区"。
+    # 讯飞不可用时（words 为空）这一步全为空，下面自动退回旧路径，行为与改前一致。
+    ref_owner = None
+    spans, zones, zone_of, main_spans = [], [], {}, []
+    if words:
+        total_ms = int(round(len(load_mono(REF_FILE)) * 1000.0 / SR))
+        spans = build_word_spans(words, ref_frame_times, total_ms)
+        main_spans, zones, zone_of = pair_fragments(spans)
+        ref_owner = assign_word_owner(ref_frame_times, main_spans, zones, zone_of)
 
     sm = difflib.SequenceMatcher(a=ref, b=mine)
     ratio = sm.ratio() * 100
@@ -502,32 +734,67 @@ def main():
         else:  # insert
             align_stat["多余音数"] += (j2 - j1)
 
+    def resolve(codes):
+        """把归属编码解析成 (连读区名列表, 单词下标列表, 单词名列表)。"""
+        if codes and any(c and c.startswith("zone:") for c in codes):
+            zs, _ws = collapse_owner(codes)
+            names = [" ".join(zones[z]["words"]) for z in zs]
+            return names, [], []
+        if ref_owner is not None and codes:
+            _zs, ws = collapse_owner(codes)
+            idxs = [i for i, w in enumerate(words) if w["word"] in ws]
+            return [], idxs, ws
+        return [], [], []
+
     diff_lines = []
     problem_words = []      # (词, 类型) 汇总
     diff_items = []         # 给人类报告用的结构化差异
+    zone_hits = {}          # 连读区名 -> {"词": [...], "n": 次数}，写进 json 供后期复用
     for op, i1, i2, j1, j2 in sm.get_opcodes():
         if op == "equal":
             continue
         if op == "replace":
             line = "  [替换] 应该读 %s  →  你读成了 %s" % (" ".join(ref[i1:i2]), " ".join(mine[j1:j2]))
-            kind, ws = "替换", word_indices(ref_word_idx[i1:i2], words)
+            kind = "替换"
+            codes = ref_owner[i1:i2] if ref_owner is not None else None
+            if codes is None:
+                ws = word_indices(ref_word_idx[i1:i2], words)
+                zn, idxs, names = [], ws, [words[i]["word"] for i in ws]
+            else:
+                zn, idxs, names = resolve(codes)
         elif op == "delete":
             line = "  [缺失] 你没读 %s（原音频里有）" % " ".join(ref[i1:i2])
-            kind, ws = "缺失", word_indices(ref_word_idx[i1:i2], words)
+            kind = "缺失"
+            codes = ref_owner[i1:i2] if ref_owner is not None else None
+            if codes is None:
+                ws = word_indices(ref_word_idx[i1:i2], words)
+                zn, idxs, names = [], ws, [words[i]["word"] for i in ws]
+            else:
+                zn, idxs, names = resolve(codes)
         else:  # insert
             # 你的录音和原音频时间轴不一定对齐，"多读"的音不能靠时间归属；
             # 改用它出现在 diff 里的位置 —— 即相邻的两个原生词之间（不依赖时间）。
             line = "  [多余] 你多读了 %s（原音频里没有）" % " ".join(mine[j1:j2])
-            kind, ws = "多余", word_indices(ref_word_idx[max(0, i1 - 1):i1 + 1], words)
-        label = format_words(ws, words)
+            kind = "多余"
+            ws = word_indices(ref_word_idx[max(0, i1 - 1):i1 + 1], words)
+            zn, idxs, names = [], ws, [words[i]["word"] for i in ws]
+        label = format_words(idxs, words, zone_names=zn if zn else None)
         if label:
             line = line + "   " + label
-            for wi in ws:
-                problem_words.append((words[wi]["word"], kind))
+            for i in idxs:
+                problem_words.append((words[i]["word"], kind))
+            for nm in zn:
+                zone_hits.setdefault(nm, {"词": nm.split(" "), "n": 0})
+                zone_hits[nm]["n"] += 1
+                # 连读区涉及的两个词都算"有问题"，原句里一并框出（并集框）
+                for wname in nm.split(" "):
+                    problem_words.append((wname, kind))
         diff_items.append({"kind": kind,
                            "ref": " ".join(ref[i1:i2]),
                            "my": " ".join(mine[j1:j2]),
-                           "words": [words[wi]["word"] for wi in ws]})
+                           "words": names,
+                           "zone": bool(zn),
+                           "zone_names": zn})
         diff_lines.append(line)
 
     log("")
@@ -549,12 +816,34 @@ def main():
     except Exception as e:
         log("（写报告失败：%s）" % e)
 
+    # 词切分：连读区 / 碎片词 / 每个词分到几个音素。
+    # 只增不改 —— "词表"（含时间戳）逐字保留，后期做"哪个词读快/读慢、调高/调低"时要用。
+    word_split = {}
+    if words:
+        word_split = {
+            "最小词长ms": MIN_WORD_MS,
+            "碎片词": [{"word": sp["word"], "start_ms": sp["start_ms"],
+                        "end_ms": sp["end_ms"], "span_ms": sp["span_ms"],
+                        "n_ph": sp["n_ph"],
+                        "原因": "时长不足 %dms" % MIN_WORD_MS}
+                       for sp in spans if sp["short"]],
+            "连读区": [{"词": z["words"], "start_ms": z["start_ms"], "end_ms": z["end_ms"],
+                        "n_ph": z["n_ph"],
+                        "归词音素数": [[spans[m]["word"], spans[m]["n_ph"]] for m in z["member_idx"]],
+                        "说明": "%s 处连读，讯飞词边界不可靠，按整体看" % " ".join(z["words"])}
+                       for z in zones],
+            "命中差异的连读区": list(zone_hits.values()),
+            "词音素分布": [{"word": sp["word"], "n_ph": sp["n_ph"],
+                            "span_ms": sp["span_ms"]} for sp in spans],
+        }
+
     try:
         with open(OUT_JSON, "w", encoding="utf-8") as f:
             json.dump({"原音频": ref, "我的模仿": mine,
                        "相似度": ratio, "对齐统计": align_stat,
                        "差异": diff_lines,
-                       "词表": words}, f, ensure_ascii=False, indent=2)
+                       "词表": words,
+                       "词切分": word_split}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
