@@ -39,8 +39,16 @@ RHYTHM_JSON = os.path.join(OUT_DIR, "节奏对比.json")
 OUT_JSON = os.path.join(OUT_DIR, "还原度综合评分.json")
 OUT_REPORT = os.path.join(OUT_DIR, "还原度综合报告.txt")
 
-# 四项权重（必须和为 1）
-WEIGHTS = {"发音": 0.40, "音变": 0.20, "语调": 0.20, "节奏": 0.20}
+# ---- 维度定义：全局唯一来源 ----
+# 顺序 = 展示顺序；权重必须和为 1。
+# 本文件不再出现第二处维度列表 —— 终端简报、报告、改进建议、payload 全部迭代它。
+# 加/删维度：改这里 + collect_parts()，两处即可。
+DIMENSIONS = [
+    ("发音", 0.40),
+    ("音变", 0.20),
+    ("语调", 0.20),
+    ("节奏", 0.20),
+]
 
 
 # ---- 日志（统一模块，带时间戳；详细模式见 logkit.py 顶部说明）----
@@ -97,28 +105,55 @@ def grade(score):
     return "待加强"
 
 
+# 各维度低于门槛时的针对性建议（键须与 DIMENSIONS 对齐；新增维度时在这里补文案）
+ADVICE = {
+    "发音": "发音是当前短板：对照报告里【替换】的音，逐个纠音（注意长短音、θ/ð、r/l）。",
+    "音变": "音变（连读/弱化/吞音）偏弱：留意原音频里被“吃掉”或黏连的音，先慢读再连读。",
+    "语调": "语调（音高起伏）偏弱：模仿原音频的升降调，疑问句尾音上扬、陈述句尾音下压。",
+    "节奏": "节奏偏弱：跟着原音频打拍子，注意停顿位置和每句的重音落点。",
+}
+
+
+# ---- 读 节奏对比.json 里「真实存在」的键 ----
+# 旧字段 总时长秒 / 对齐 / 停顿 / 子项分 已失效（现网 JSON 里不存在）。
+# 若继续用 .get(..., 0) 兜底，会静默变成 0 —— 所以这里取不到就告警。
+def rhythm_section(rhythm, key):
+    """取 节奏_讯飞.<key>；取不到则记日志告警并返回 None。"""
+    if not rhythm:
+        return None
+    sec = (rhythm.get("节奏_讯飞") or {}).get(key)
+    if sec is None:
+        log("⚠ 节奏对比.json 里没有 节奏_讯飞.%s（字段失效或脚本未更新），该项显示为「—」" % key,
+            show=True)
+    return sec
+
+
+def collect_parts(phoneme, rhythm):
+    """按维度取分：键须与 DIMENSIONS 对齐。加维度时改这里（全局唯一取数处）。"""
+    stat = phoneme.get("对齐统计")
+    return {
+        "发音": score_pronunciation(stat),
+        "音变": score_phoneme_change(stat),
+        "语调": rhythm.get("语调分"),
+        "节奏": rhythm.get("节奏分"),
+    }
+
+
 def build_advice(parts, phoneme, rhythm):
-    """根据分项分与明细生成"下一步怎么练"的建议。"""
+    """根据分项分与明细生成"下一步怎么练"的建议。维度顺序来自 DIMENSIONS。"""
     tips = []
-    p, c, t, r = parts.get("发音"), parts.get("音变"), parts.get("语调"), parts.get("节奏")
-    lows = [k for k, v in [("发音", p), ("音变", c), ("语调", t), ("节奏", r)]
-            if v is not None and v < 70]
+    lows = [k for k, _w in DIMENSIONS if parts.get(k) is not None and parts[k] < 70]
     if not lows:
-        tips.append("四项都在 70 分以上，整体还原度不错，可以练更长、更快的句子。")
-    if p is not None and p < 75:
-        tips.append("发音是当前短板：对照报告里【替换】的音，逐个纠音（注意长短音、θ/ð、r/l）。")
-    if c is not None and c < 75:
-        tips.append("音变（连读/弱化/吞音）偏弱：留意原音频里被“吃掉”或黏连的音，先慢读再连读。")
-    if r is not None and r < 75:
-        tips.append("节奏偏弱：跟着原音频打拍子，注意停顿位置和每句的重音落点。")
-    if t is not None and t < 75:
-        tips.append("语调（音高起伏）偏弱：模仿原音频的升降调，疑问句尾音上扬、陈述句尾音下压。")
-    # 从停顿明细再补一条针对性提示
-    if rhythm:
-        ps = rhythm.get("停顿", {})
-        if ps.get("原音频处数") != ps.get("我的处数"):
-            tips.append("停顿数量与原音频不一致（原音频 %s 处 / 你 %s 处），"
-                        "注意不要多停或少停。" % (ps.get("原音频处数"), ps.get("我的处数")))
+        tips.append("各维度都在 70 分以上，整体还原度不错，可以练更长、更快的句子。")
+    for k, _w in DIMENSIONS:
+        v = parts.get(k)
+        if v is not None and v < 75 and k in ADVICE:
+            tips.append(ADVICE[k])
+    # 从停顿明细再补一条针对性提示（真实键：节奏_讯飞.句子边界停顿）
+    ps = rhythm_section(rhythm, "句子边界停顿")
+    if ps and ps.get("原音频处数") != ps.get("我的处数"):
+        tips.append("停顿数量与原音频不一致（原音频 %s 处 / 你 %s 处），注意不要多停或少停。"
+                    % (ps.get("原音频处数"), ps.get("我的处数")))
     return tips
 
 
@@ -147,26 +182,24 @@ def main():
 
     log_step("计算分项分与综合分")
     stat = phoneme.get("对齐统计")
-    p_score = score_pronunciation(stat)
-    c_score = score_phoneme_change(stat)
-    r_score = rhythm.get("节奏分")
-    t_score = rhythm.get("语调分")
-    parts = {"发音": p_score, "音变": c_score, "语调": t_score, "节奏": r_score}
+    parts = collect_parts(phoneme, rhythm)
 
     # 综合分：只有拿到的项按权重归一（缺项不参与，避免误判为 0）
-    avail = {k: v for k, v in parts.items() if v is not None}
-    wsum = sum(WEIGHTS[k] for k in avail)
-    overall = sum(WEIGHTS[k] * v for k, v in avail.items()) / wsum if wsum else 0.0
+    avail = {k: parts[k] for k, _w in DIMENSIONS if parts.get(k) is not None}
+    wsum = sum(w for k, w in DIMENSIONS if k in avail)
+    overall = sum(w * parts[k] for k, w in DIMENSIONS if k in avail) / wsum if wsum else 0.0
+    # 有效权重 = 额定权重在「缺项」后归一的结果（与 payload.权重 的额定值口径不同）
+    eff_weights = ({k: round(w / wsum, 4) for k, w in DIMENSIONS if k in avail}
+                   if wsum else {})
 
     # ---- 终端简报 ----
     out("综合还原度：%.1f / 100   （等级：%s）" % (overall, grade(overall)))
     out("")
     out("分项：")
-    for k in ("发音", "音变", "语调", "节奏"):
-        v = parts[k]
+    for k, w in DIMENSIONS:
+        v = parts.get(k)
         out("   %s  %s  / 100   (权重 %d%%)"
-            % (k, ("%.1f" % v) if v is not None else "  —",
-               int(WEIGHTS[k] * 100)))
+            % (k, ("%.1f" % v) if v is not None else "  —", int(w * 100)))
     out("")
     out("明细参考：")
     if stat:
@@ -174,9 +207,20 @@ def main():
             % (stat.get("替换音数", 0), stat.get("缺失音数", 0), stat.get("多余音数", 0),
                stat.get("匹配音数", 0), stat.get("原生音数", 0)))
     if rhythm:
-        sub = rhythm.get("子项分", {})
-        out("   节奏：时长 %s ｜ 停顿 %s ｜ 能量DTW %s"
-            % (sub.get("时长相似"), sub.get("停顿相似"), sub.get("能量DTW相似")))
+        net = rhythm_section(rhythm, "整句净时长") or {}
+        ps = rhythm_section(rhythm, "句子边界停顿") or {}
+        st = rhythm.get("重音_信号") or {}
+        if net:
+            out("   节奏：净时长 原 %.2fs / 我 %.2fs（相对差 %+.1f%%）"
+                % (net.get("原音频", 0), net.get("我的", 0), (net.get("相对差") or 0) * 100))
+        if ps:
+            out("   停顿：原音频 %s 处 / 我 %s 处"
+                % (ps.get("原音频处数", "—"), ps.get("我的处数", "—")))
+        if st:
+            out("   重音：突出块 原 %d / 我 %d（命中 %d ｜ 漏 %d ｜ 多 %d）"
+                % (len(st.get("原音频突出块") or []), len(st.get("我的突出块") or []),
+                   len(st.get("命中") or []), len(st.get("漏（原音频有）") or []),
+                   len(st.get("多（我的）") or [])))
 
     # ---- 写 JSON（给机器）----
     log_step("写综合评分与报告")
@@ -185,8 +229,10 @@ def main():
     payload = {
         "综合还原度": round(overall, 1),
         "等级": grade(overall),
-        "权重": WEIGHTS,
-        "分项分": {k: (round(v, 1) if v is not None else None) for k, v in parts.items()},
+        "权重": dict(DIMENSIONS),
+        "权重(有效)": eff_weights,
+        "分项分": {k: (round(parts[k], 1) if parts.get(k) is not None else None)
+                   for k, _w in DIMENSIONS},
         "音素明细": stat,
         "节奏明细": rhythm,
         "音素相似度(原始)": phoneme.get("相似度"),
@@ -222,11 +268,11 @@ def write_report(overall, parts, phoneme, rhythm):
     L.append("-" * 60)
     L.append("一、分项得分（发音最重，其余持平）")
     L.append("-" * 60)
-    for k in ("发音", "音变", "语调", "节奏"):
-        v = parts[k]
+    for k, w in DIMENSIONS:
+        v = parts.get(k)
         bar = "—" if v is None else "%.1f" % v
         L.append("   %s  %6s / 100    权重 %d%%    %s"
-                 % (k, bar, int(WEIGHTS[k] * 100), grade(v) if v is not None else ""))
+                 % (k, bar, int(w * 100), grade(v) if v is not None else ""))
     L.append("")
 
     # 二、发音 / 音变问题（复用音素对比的问题清单）
@@ -269,18 +315,33 @@ def write_report(overall, parts, phoneme, rhythm):
     L.append("四、节奏 / 语调")
     L.append("-" * 60)
     if rhythm:
-        td = rhythm.get("总时长秒", {})
-        L.append("    时长：原音频 %.2fs   |   你 %.2fs   |   差 %+.2fs"
-                 % (td.get("原音频", 0), td.get("我的", 0), td.get("差", 0)))
-        al = rhythm.get("对齐", {})
-        L.append("    整体平移：%+.2fs（已自动对齐，不扣分）" % al.get("整体平移秒", 0))
-        ps = rhythm.get("停顿", {})
-        L.append("    停顿：原音频 %d 处  |  你 %d 处"
-                 % (ps.get("原音频处数", 0), ps.get("我的处数", 0)))
-        sub = rhythm.get("子项分", {})
-        L.append("    子项分：时长 %.1f ｜ 停顿 %.1f ｜ 能量DTW %.1f ｜ F0起伏 %.1f"
-                 % (sub.get("时长相似", 0), sub.get("停顿相似", 0),
-                    sub.get("能量DTW相似", 0), sub.get("F0起伏幅度", 0)))
+        net = rhythm_section(rhythm, "整句净时长")
+        ps = rhythm_section(rhythm, "句子边界停顿")
+        st = rhythm.get("重音_信号") or {}
+        if net:
+            L.append("    净时长：原音频 %.2fs   |   你 %.2fs   |   相对差 %+.1f%%"
+                     % (net.get("原音频", 0), net.get("我的", 0), (net.get("相对差") or 0) * 100))
+        else:
+            L.append("    净时长：（数据缺失）")
+        if (rhythm.get("节奏_讯飞") or {}).get("序号对齐风险"):
+            L.append("    ⚠ 两侧词块序号可能未对齐，以下节奏明细仅供参考")
+        if ps:
+            L.append("    停顿：原音频 %s 处  |  你 %s 处"
+                     % (ps.get("原音频处数", "—"), ps.get("我的处数", "—")))
+            mine = ps.get("我的") or []
+            if mine:
+                L.append("          你多停的位置：" + "、".join(
+                    "%s 后（%+.2fs）" % (p.get("after_word"), p.get("gap", 0)) for p in mine))
+        else:
+            L.append("    停顿：（数据缺失）")
+        if st:
+            L.append("    重音：原音频突出 %d 块  |  你 %d 块  |  命中 %d  |  漏 %d  |  多 %d"
+                     % (len(st.get("原音频突出块") or []), len(st.get("我的突出块") or []),
+                        len(st.get("命中") or []), len(st.get("漏（原音频有）") or []),
+                        len(st.get("多（我的）") or [])))
+            miss = st.get("漏（原音频有）") or []
+            if miss:
+                L.append("          漏掉的重音：" + "、".join(x.get("块", "") for x in miss))
     L.append("")
 
     # 五、改进建议
