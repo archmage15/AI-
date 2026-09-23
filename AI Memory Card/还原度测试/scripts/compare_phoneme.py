@@ -88,8 +88,9 @@ MIN_WORD_MS = 80        # 短于此长度的词，视为"碎片词"，可能与�
 MERGE_GAP_MS = 60       # 碎片词与邻居间隔小于此值才合并（FRAME_MS * 3）
 
 
-def log(msg=""):
-    print(str(msg), flush=True)
+# ---- 日志（统一模块，带时间戳；详细模式见 logkit.py 顶部说明）----
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from logkit import log, out, log_setup, log_done, log_step, log_error, VERBOSE
 
 
 def load_mono(path):
@@ -651,37 +652,42 @@ def write_report(ref, mine, sm, words, ratio, diff_items, problem_words):
 
 
 def main():
+    # 先把耗时大户 import 掉，再开日志 —— 否则 log_setup 的时间戳会比真正开始早十几秒
     import torch
     from transformers import AutoModelForCTC
+    log_setup("音素对比")
 
-    log("=" * 62)
-    log("   还原度对比 · 音素")
-    log("=" * 62)
+    out("=" * 62)
+    out("   还原度对比 · 音素")
+    out("=" * 62)
 
     if not (os.path.exists(REF_FILE) and os.path.exists(MY_FILE)):
-        log("")
-        log("X 没找到音频文件。请把两个 wav 放进本文件夹：")
-        log("    " + REF_FILE)
-        log("    " + MY_FILE)
+        out("")
+        out("X 没找到音频文件。请把两个 wav 放进本文件夹：")
+        out("    " + REF_FILE)
+        out("    " + MY_FILE)
+        log_done("（音频缺失，提前退出）")
         return
 
-    log("")
-    log("加载音素识别模型 ...")
+    log_step("加载音素识别模型")
     model_path = ensure_model()
     fe = load_feature_extractor(model_path)
     model = AutoModelForCTC.from_pretrained(model_path)
     model.eval()
     id2tok = load_vocab(model_path)
-    log("模型就绪。")
+    log("模型就绪（%s）" % os.path.basename(model_path), verbose=True)
 
     results = {}
     frames_map = {}
     for tag, path in (("原音频", REF_FILE), ("我的模仿", MY_FILE)):
-        log("正在识别：%s ..." % tag)
+        log_step("识别：%s" % tag)
         audio = load_mono(path)
+        log("   音频时长 %.2f 秒（%d 采样点）" % (len(audio) / float(SR), len(audio)),
+            verbose=True)
         inputs = fe(audio, sampling_rate=SR, return_tensors="pt")
         with torch.no_grad():
             logits = model(inputs.input_values).logits
+        log("   模型输出 %d 帧（每帧 %dms）" % (logits.shape[1], FRAME_MS), verbose=True)
         ids = torch.argmax(logits, dim=-1)[0].tolist()
         tokens, frames = ctc_decode(ids, id2tok)
         results[tag] = tokens
@@ -690,11 +696,11 @@ def main():
 
     ref = results["原音频"]
     mine = results["我的模仿"]
+    log("原音频 %d 音 vs 我的 %d 音" % (len(ref), len(mine)), verbose=True)
 
     # 可选：对原音频跑讯飞转写，拿到"词 + 时间"，给音素打单词标签
     words = []
-    log("")
-    log("正在获取单词时间轴（讯飞转写）...")
+    log_step("调用讯飞转写（获取词时间轴）")
     try:
         words = transcribe_words(REF_FILE)
         log("   拿到 %d 个词：%s" % (len(words), " ".join(w["word"] for w in words)))
@@ -711,11 +717,17 @@ def main():
     ref_owner = None
     spans, zones, zone_of, main_spans = [], [], {}, []
     if words:
+        log_step("连读区识别")
         total_ms = int(round(len(load_mono(REF_FILE)) * 1000.0 / SR))
         spans = build_word_spans(words, ref_frame_times, total_ms)
         main_spans, zones, zone_of = pair_fragments(spans)
         ref_owner = assign_word_owner(ref_frame_times, main_spans, zones, zone_of)
+        log("   词区间 %d 段；碎片词 %d 个；连读区 %d 处"
+            % (len(spans), sum(1 for s in spans if s["short"]), len(zones)), verbose=True)
+        for z in zones:
+            log("   连读区：%s（%d-%dms）" % (" ".join(z["words"]), z["start_ms"], z["end_ms"]))
 
+    log_step("对齐与差异分析")
     sm = difflib.SequenceMatcher(a=ref, b=mine)
     ratio = sm.ratio() * 100
 
@@ -797,24 +809,28 @@ def main():
                            "zone_names": zn})
         diff_lines.append(line)
 
-    log("")
-    log("=" * 62)
-    log("   音素对比结果")
-    log("=" * 62)
-    log("整体音素相似度：%.1f / 100" % ratio)
+    out("")
+    out("=" * 62)
+    out("   音素对比结果")
+    out("=" * 62)
+    out("整体音素相似度：%.1f / 100" % ratio)
     if diff_lines:
-        log("差异 %d 处（明细见报告）" % len(diff_lines))
+        out("差异 %d 处（明细见报告）" % len(diff_lines))
     else:
-        log("音素序列完全一致。")
+        out("音素序列完全一致。")
+    log("对齐统计：匹配 %d ｜ 替换 %d ｜ 缺失 %d ｜ 多余 %d"
+        % (align_stat["匹配音数"], align_stat["替换音数"],
+           align_stat["缺失音数"], align_stat["多余音数"]), verbose=True)
 
     # 写一份"给人看"的纯文本报告（json 留给机器/AI）
+    log_step("写报告与数据")
     try:
         write_report(ref, mine, sm, words, ratio, diff_items, problem_words)
-        log("")
-        log("报告（人看）：音素对比_报告.txt")
-        log("数据（机器）：音素对比.json")
+        out("")
+        out("报告（人看）：音素对比_报告.txt")
+        out("数据（机器）：音素对比.json")
     except Exception as e:
-        log("（写报告失败：%s）" % e)
+        log("（写报告失败：%s）" % e, show=True)
 
     # 词切分：连读区 / 碎片词 / 每个词分到几个音素。
     # 只增不改 —— "词表"（含时间戳）逐字保留，后期做"哪个词读快/读慢、调高/调低"时要用。
@@ -847,14 +863,15 @@ def main():
     except Exception:
         pass
 
+    log_done("音素对比")
+
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
         import traceback
-        log("[致命错误]")
-        log(traceback.format_exc())
+        log_error(traceback.format_exc())
     try:
         input("按回车退出 ...")
     except Exception:

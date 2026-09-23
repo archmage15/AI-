@@ -21,6 +21,26 @@ rem ============================================================
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
 
+rem ------------------------------------------------------------
+rem  Log switches (optional). Remove the "rem" to turn one on.
+rem
+rem  LOG_QUIET=1   terminal shows only the result blocks,
+rem                step-by-step progress goes to the log files only.
+rem                Use this for everyday runs to keep the window clean.
+rem
+rem  LOG_VERBOSE=1 also log intermediate numbers (phoneme counts,
+rem                word counts, sub-scores) into the log files.
+rem
+rem  LOG_OFF=1     do not write log files at all (terminal unchanged).
+rem
+rem  Full logs are written to the  output\logs  folder:
+rem    one file appended across runs (full history),
+rem    one file rewritten each run (latest run only).
+rem ------------------------------------------------------------
+rem set LOG_QUIET=1
+rem set LOG_VERBOSE=1
+rem set LOG_OFF=1
+
 set "PYEXE="
 set "CAND=%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
 if exist "%CAND%" set "PYEXE=%CAND%"

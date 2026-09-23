@@ -43,8 +43,9 @@ OUT_REPORT = os.path.join(OUT_DIR, "还原度综合报告.txt")
 WEIGHTS = {"发音": 0.40, "音变": 0.20, "语调": 0.20, "节奏": 0.20}
 
 
-def log(msg=""):
-    print(str(msg), flush=True)
+# ---- 日志（统一模块，带时间戳；详细模式见 logkit.py 顶部说明）----
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from logkit import log, out, log_setup, log_done, log_step, log_error, VERBOSE
 
 
 def read_json(path):
@@ -122,20 +123,29 @@ def build_advice(parts, phoneme, rhythm):
 
 
 def main():
-    log("=" * 62)
-    log("   还原度综合评分")
-    log("=" * 62)
-    log("")
+    log_setup("综合评分")
+    out("=" * 62)
+    out("   还原度综合评分")
+    out("=" * 62)
+    out("")
 
+    log_step("读取前两步的产出")
     phoneme = read_json(PHONEME_JSON)
     rhythm = read_json(RHYTHM_JSON)
     if phoneme is None:
-        log("X 缺少 音素对比.json —— 请先跑 compare_phoneme.py（或一键 bat）。")
+        out("X 缺少 音素对比.json —— 请先跑 compare_phoneme.py（或一键 bat）。")
+        log_done("（缺前置数据，提前退出）")
         return
     if rhythm is None:
-        log("X 缺少 节奏对比.json —— 请先跑 compare_rhythm.py（或一键 bat）。")
+        out("X 缺少 节奏对比.json —— 请先跑 compare_rhythm.py（或一键 bat）。")
+        log_done("（缺前置数据，提前退出）")
         return
+    log("   音素对比.json：相似度 %s，差异 %d 条"
+        % (phoneme.get("相似度"), len(phoneme.get("差异") or [])), verbose=True)
+    log("   节奏对比.json：节奏 %s ｜ 语调 %s"
+        % (rhythm.get("节奏分"), rhythm.get("语调分")), verbose=True)
 
+    log_step("计算分项分与综合分")
     stat = phoneme.get("对齐统计")
     p_score = score_pronunciation(stat)
     c_score = score_phoneme_change(stat)
@@ -149,27 +159,30 @@ def main():
     overall = sum(WEIGHTS[k] * v for k, v in avail.items()) / wsum if wsum else 0.0
 
     # ---- 终端简报 ----
-    log("综合还原度：%.1f / 100   （等级：%s）" % (overall, grade(overall)))
-    log("")
-    log("分项：")
+    out("综合还原度：%.1f / 100   （等级：%s）" % (overall, grade(overall)))
+    out("")
+    out("分项：")
     for k in ("发音", "音变", "语调", "节奏"):
         v = parts[k]
-        log("   %s  %s  / 100   (权重 %d%%)"
+        out("   %s  %s  / 100   (权重 %d%%)"
             % (k, ("%.1f" % v) if v is not None else "  —",
                int(WEIGHTS[k] * 100)))
-    log("")
-    log("明细参考：")
+    out("")
+    out("明细参考：")
     if stat:
-        log("   音素：替换 %d ｜ 缺失 %d ｜ 多余 %d ｜ 匹配 %d（原生共 %d 音）"
+        out("   音素：替换 %d ｜ 缺失 %d ｜ 多余 %d ｜ 匹配 %d（原生共 %d 音）"
             % (stat.get("替换音数", 0), stat.get("缺失音数", 0), stat.get("多余音数", 0),
                stat.get("匹配音数", 0), stat.get("原生音数", 0)))
     if rhythm:
         sub = rhythm.get("子项分", {})
-        log("   节奏：时长 %s ｜ 停顿 %s ｜ 能量DTW %s"
+        out("   节奏：时长 %s ｜ 停顿 %s ｜ 能量DTW %s"
             % (sub.get("时长相似"), sub.get("停顿相似"), sub.get("能量DTW相似")))
 
     # ---- 写 JSON（给机器）----
-    out = {
+    log_step("写综合评分与报告")
+    # 注意：这里叫 payload 不叫 out —— out 是 logkit 的结果行函数，
+    # 若用同名局部变量会遮蔽它，导致 main() 前面调用 out() 报 UnboundLocalError。
+    payload = {
         "综合还原度": round(overall, 1),
         "等级": grade(overall),
         "权重": WEIGHTS,
@@ -180,19 +193,20 @@ def main():
     }
     try:
         with open(OUT_JSON, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log("（写 json 失败：%s）" % e)
+        log("（写 json 失败：%s）" % e, show=True)
 
     # ---- 写报告（给人）----
     try:
         write_report(overall, parts, phoneme, rhythm)
     except Exception as e:
-        log("（写报告失败：%s）" % e)
+        log("（写报告失败：%s）" % e, show=True)
 
-    log("")
-    log("数据（机器）：还原度综合评分.json")
-    log("报告（人看）：还原度综合报告.txt")
+    out("")
+    out("数据（机器）：还原度综合评分.json")
+    out("报告（人看）：还原度综合报告.txt")
+    log_done("综合评分")
 
 
 def write_report(overall, parts, phoneme, rhythm):
@@ -286,8 +300,7 @@ if __name__ == "__main__":
         main()
     except Exception:
         import traceback
-        log("[致命错误]")
-        log(traceback.format_exc())
+        log_error(traceback.format_exc())
     try:
         input("按回车退出 ...")
     except Exception:
