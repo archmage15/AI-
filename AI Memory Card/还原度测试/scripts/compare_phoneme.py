@@ -87,10 +87,34 @@ FRAME_MS = 20
 MIN_WORD_MS = 80        # 短于此长度的词，视为"碎片词"，可能与邻居构成连读
 MERGE_GAP_MS = 60       # 碎片词与邻居间隔小于此值才合并（FRAME_MS * 3）
 
+# 「参考音素表」：由 gen_ref_phonemes.py 离线预生成（espeak-ng 是 GPL，只在本机跑一次）
+# 运行时只读这个纯数据文件 —— 绝不 import / 链接 espeak-ng
+REF_PHONEME_JSON = os.path.join(SRC_DIR, "参考音素.json")
+
+# 判"这个词读错了"的阈值（compute_word_errors 用）
+WORD_ERR_RATIO = 0.40   # 错音占该词音素比例 ≥ 此值
+WORD_ERR_MIN = 2        # 或错音个数 ≥ 此值
+
 
 # ---- 日志（统一模块，带时间戳；详细模式见 logkit.py 顶部说明）----
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from logkit import log, out, log_setup, log_done, log_step, log_error, VERBOSE
+
+
+def load_ref_phonemes():
+    """读离线预生成的参考音素表。返回 dict 或 None（读不到 → 下游降级）。"""
+    if not os.path.exists(REF_PHONEME_JSON):
+        return None
+    try:
+        with open(REF_PHONEME_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log("⚠ 参考音素.json 读失败：%s" % e, show=True)
+        return None
+    if not data.get("音素") or not data.get("词边界"):
+        log("⚠ 参考音素.json 内容不完整（缺 音素 / 词边界）", show=True)
+        return None
+    return data
 
 
 def load_mono(path):
@@ -408,6 +432,75 @@ def build_word_spans(words, frame_times, total_ms):
     return spans
 
 
+def build_text_spans(word_bounds, owner, frame_times):
+    """用「参考文本给的词边界 + CTC 帧给的时间」拼出 spans。
+
+    ⚠️ 与旧 build_word_spans **同构**（同样的键），所以 pair_fragments 逐字不改就能接：
+        {idx, word, start_ms, end_ms, span_ms, n_ph, short}
+
+    参数
+      word_bounds : 参考音素.json 的 词边界 [{word, a, b, 角色}]
+      owner       : map_words_to_audio 的输出 —— 每个「实际音素」归属的词下标
+      frame_times : 每个实际音素的时间(ms)，与 owner 等长
+
+    沿用了旧实现的两个修补（首尾补边、单调修正）—— 换数据源不等于可以少护栏。
+    """
+    if not word_bounds:
+        return []
+
+    spans = []
+    for wi, wb in enumerate(word_bounds):
+        ts = [frame_times[j] for j in range(len(owner)) if owner[j] == wi]
+        spans.append({"idx": wi, "word": wb["word"],
+                      "start_ms": int(min(ts)) if ts else None,
+                      # frame_times 存的是音素的**起始**帧，末尾要补一帧（20ms）
+                      "end_ms": (int(max(ts)) + FRAME_MS) if ts else None,
+                      "n_ph": len(ts)})
+
+    # ⚠️ 不做"首尾补边"（旧 build_word_spans 有，这里实测**不该有**）：
+    # 旧实现的时间来自讯飞词表，补边只是填边角空白；
+    # 新实现的时间**直接来自音素帧** —— 把首词 start 硬拉成 0 会让它的时长虚高
+    # （实测：so 真实 740→1030ms，补边后变成 0→1000ms）。那会污染节奏维度。
+
+    # 1) 一个音素都没分到的词（如原音频里的感叹词 oh）：用邻居边界补一个区间。
+    #    绝不能给 0 宽 —— 那会被 pair_fragments 当成"碎片词"并进连读区，纯属误报。
+    for i, sp in enumerate(spans):
+        if sp["start_ms"] is not None and sp["end_ms"] is not None:
+            continue
+        prev_end = None
+        for k in range(i - 1, -1, -1):
+            if spans[k]["end_ms"] is not None:
+                prev_end = spans[k]["end_ms"]
+                break
+        next_start = None
+        for k in range(i + 1, len(spans)):
+            if spans[k]["start_ms"] is not None:
+                next_start = spans[k]["start_ms"]
+                break
+        if prev_end is None and next_start is None:
+            sp["start_ms"] = sp["end_ms"] = 0
+        elif prev_end is None:
+            sp["start_ms"], sp["end_ms"] = next_start - 1, next_start
+        elif next_start is None:
+            sp["start_ms"], sp["end_ms"] = prev_end, prev_end + 1
+        else:
+            mid = (prev_end + next_start) // 2
+            sp["start_ms"], sp["end_ms"] = mid, max(mid + 1, next_start)
+
+    # 2) 单调修正：start 必须严格递增（帧边界会抖，可能压出 start >= end）
+    for i in range(1, len(spans)):
+        if spans[i]["start_ms"] <= spans[i - 1]["start_ms"]:
+            spans[i]["start_ms"] = spans[i - 1]["start_ms"] + 1
+        if spans[i]["start_ms"] >= spans[i]["end_ms"]:
+            spans[i]["end_ms"] = spans[i]["start_ms"] + 1
+
+    for sp in spans:
+        sp["span_ms"] = sp["end_ms"] - sp["start_ms"]
+        sp["short"] = sp["span_ms"] < MIN_WORD_MS
+
+    return spans
+
+
 def pair_fragments(spans):
     """把"碎片词"和它的邻居并成"连读区"。
 
@@ -513,6 +606,57 @@ def assign_word_owner(times_ms, spans, zones, main_map):
     return out
 
 
+def map_words_to_audio(text_ph, audio_ph, word_bounds):
+    """按「参考音素序列」与「实际音素序列」的对齐关系，给每个实际音素定词归属。
+
+    返回：list，长度 = len(audio_ph)，每项是 word_bounds 的下标（int）。
+
+    ⚠️ 这是替掉 assign_word_owner 的关键改动。旧实现拿音素**时间点**去撞词区间，
+    跨词边界时会把音归错词 —— 实测：`still at the` 里 at 的 /t/ 在 /ð/ 前省掉了，
+    却被算到 the 头上，报告写成「[缺音] the：少了 t」（正确答案是 at）。
+    改成按**音素序号**对齐 —— 正是旧文档 §7.3 那句
+    「比较单位必须是音素序号 / 句子内相对位置，绝不能拿绝对时间戳直接相减」。
+    """
+    if not audio_ph:
+        return []
+    if not text_ph or not word_bounds:
+        return [0] * len(audio_ph)
+
+    pos2word = {}
+    for wi, wb in enumerate(word_bounds):
+        for i in range(wb["a"], wb["b"]):
+            pos2word[i] = wi
+
+    owner = [None] * len(audio_ph)
+    sm = difflib.SequenceMatcher(a=text_ph, b=audio_ph)
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            for k in range(min(i2 - i1, j2 - j1)):
+                owner[j1 + k] = pos2word.get(i1 + k)
+        elif op == "replace":
+            n, m = i2 - i1, j2 - j1
+            for k in range(m):
+                i = i1 + (k * n // m) if m else i1
+                owner[j1 + k] = pos2word.get(min(i, i2 - 1))
+        # delete：文本有、实际没有 → 没有实际音素要归属
+        # insert：实际多出来的音 → 交给下面的"就近继承"
+
+    # 未定的（多读出来的音）：继承前一个词；开头就多读的，取后面第一个
+    last = None
+    for j in range(len(owner)):
+        if owner[j] is None:
+            owner[j] = last
+        else:
+            last = owner[j]
+    nxt = None
+    for j in range(len(owner) - 1, -1, -1):
+        if owner[j] is None:
+            owner[j] = nxt
+        else:
+            nxt = owner[j]
+    return [0 if o is None else o for o in owner]
+
+
 def collapse_owner(codes):
     """把归属编码压成 (连读区名列表, 单词名列表)，保持首次出现顺序。"""
     zones_seen, words_seen = [], []
@@ -528,6 +672,48 @@ def collapse_owner(codes):
             if name not in words_seen:
                 words_seen.append(name)
     return zones_seen, words_seen
+
+
+def compute_word_errors(word_bounds, ref_ph, ref_owner, my_ph, my_owner):
+    """逐词比较「原音频实际音素」与「模仿实际音素」，标出读错的词。
+
+    ★ 基准（09-23 定）：**以原音频实际音素为准**，参考文本只用来定词边界。
+      理由：判据是「还原度」（像不像原音频），不是「达标度」（像不像字典标准音）。
+      连读吞音这类 —— 原音频也吞、学生也吞 → **不算错**。
+      反例：若拿参考文本 `want to` 当基准，学生把 want to 正确连读成 wanna
+      会被误报成"缺音"，那就把对的判成错的了。
+
+    返回：[{词序, 词, 角色, 类型, 期望音素, 实读音素, 错误音数, 错误比例}]
+    """
+    kind_cn = {"replace": "替换", "delete": "缺失", "insert": "多余"}
+    out = []
+    for wi, wb in enumerate(word_bounds):
+        ref_seg = [ref_ph[j] for j in range(len(ref_ph)) if ref_owner[j] == wi]
+        my_seg = [my_ph[j] for j in range(len(my_ph)) if my_owner[j] == wi]
+        if not ref_seg and not my_seg:
+            continue
+        sm = difflib.SequenceMatcher(a=ref_seg, b=my_seg)
+        wrong, kinds = 0, []
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op == "equal":
+                continue
+            wrong += max(i2 - i1, j2 - j1)
+            kinds.append(kind_cn.get(op, op))
+        if not wrong:
+            continue
+        ratio = wrong / float(max(len(ref_seg), len(my_seg), 1))
+        if wrong >= WORD_ERR_MIN or ratio >= WORD_ERR_RATIO:
+            out.append({
+                "词序": wi + 1,
+                "词": wb["word"],
+                "角色": wb.get("角色"),
+                "类型": "+".join(sorted(set(kinds))),
+                "期望音素": " ".join(ref_seg),
+                "实读音素": " ".join(my_seg),
+                "错误音数": wrong,
+                "错误比例": round(ratio, 3),
+            })
+    return out
 
 
 def format_words(word_ids, words, zone_names=None):
@@ -698,34 +884,48 @@ def main():
     mine = results["我的模仿"]
     log("原音频 %d 音 vs 我的 %d 音" % (len(ref), len(mine)), verbose=True)
 
-    # 可选：对原音频跑讯飞转写，拿到"词 + 时间"，给音素打单词标签
-    words = []
-    log_step("调用讯飞转写（获取词时间轴）")
-    try:
-        words = transcribe_words(REF_FILE)
-        log("   拿到 %d 个词：%s" % (len(words), " ".join(w["word"] for w in words)))
-    except Exception as e:
-        words = []
-        log("   （跳过，只给音素级结果）：%s" % e)
+    # 读「参考音素表」（由 gen_ref_phonemes.py 离线预生成）—— 不再调讯飞。
+    # 词边界来自参考文本；音素归属按「序号对齐」定（见 map_words_to_audio）
+    log_step("读取参考音素表")
+    ref_data = load_ref_phonemes()
+    text_ph = ref_data["音素"] if ref_data else []
+    word_bounds = ref_data["词边界"] if ref_data else []
+    if ref_data:
+        log("   参考音素 %d 个，词边界 %d 个（角色 %s）"
+            % (len(text_ph), len(word_bounds),
+               "".join(sorted({wb.get("角色") or "?" for wb in word_bounds}))))
+    else:
+        log("   ⚠ 参考音素.json 不可用 → 本次只出音素级结果，不标词", show=True)
 
-    # 音素时间轴（原音频侧）：帧号 × 20ms
+    # 音素时间轴：帧号 × FRAME_MS
     ref_frame_times = [f * FRAME_MS for f in frames_map["原音频"]]
-    ref_word_idx = assign_word_indices(ref_frame_times, words)   # 旧路径，保留作降级
+    my_frame_times = [f * FRAME_MS for f in frames_map["我的模仿"]]
 
-    # 连读区识别：把讯飞词表变成稳定区间，碎片词与邻居并成"连读区"。
-    # 讯飞不可用时（words 为空）这一步全为空，下面自动退回旧路径，行为与改前一致。
-    ref_owner = None
-    spans, zones, zone_of, main_spans = [], [], {}, []
-    if words:
-        log_step("连读区识别")
-        total_ms = int(round(len(load_mono(REF_FILE)) * 1000.0 / SR))
-        spans = build_word_spans(words, ref_frame_times, total_ms)
-        main_spans, zones, zone_of = pair_fragments(spans)
-        ref_owner = assign_word_owner(ref_frame_times, main_spans, zones, zone_of)
-        log("   词区间 %d 段；碎片词 %d 个；连读区 %d 处"
-            % (len(spans), sum(1 for s in spans if s["short"]), len(zones)), verbose=True)
-        for z in zones:
-            log("   连读区：%s（%d-%dms）" % (" ".join(z["words"]), z["start_ms"], z["end_ms"]))
+    # 音素归属：按「参考音素序列 ↔ 实际音素序列」的**对齐关系**定，
+    # 不再按时间点撞词区间（那正是"跨词归错词"的根因）
+    ref_owner = map_words_to_audio(text_ph, ref, word_bounds)
+    my_owner = map_words_to_audio(text_ph, mine, word_bounds)
+
+    # 两侧词块：节奏脚本的唯一计时输入，也是连读区检测的入口
+    log_step("连读区识别")
+    spans = build_text_spans(word_bounds, ref_owner, ref_frame_times)
+    spans_my = build_text_spans(word_bounds, my_owner, my_frame_times)
+    main_spans, zones, zone_of = pair_fragments(spans)          # ★ 逐字不改
+    _main_my, zones_my, _zone_my = pair_fragments(spans_my)
+    log("   词区间 %d 段；碎片词 %d 个；连读区 %d 处"
+        % (len(spans), sum(1 for s in spans if s["short"]), len(zones)), verbose=True)
+    for z in zones:
+        log("   连读区：%s（%d-%dms）" % (" ".join(z["words"]), z["start_ms"], z["end_ms"]))
+
+    # 词下标 -> 连读区下标（差异分析里判断"这个词在连读区里吗"）
+    zone_by_word = {}
+    for z in zones:
+        for m in z["member_idx"]:
+            zone_by_word[m] = z["zone_idx"]
+    my_zone_words = set()
+    for z in zones_my:
+        for m in z["member_idx"]:
+            my_zone_words.add(m)
 
     log_step("对齐与差异分析")
     sm = difflib.SequenceMatcher(a=ref, b=mine)
@@ -746,17 +946,19 @@ def main():
         else:  # insert
             align_stat["多余音数"] += (j2 - j1)
 
-    def resolve(codes):
-        """把归属编码解析成 (连读区名列表, 单词下标列表, 单词名列表)。"""
-        if codes and any(c and c.startswith("zone:") for c in codes):
-            zs, _ws = collapse_owner(codes)
-            names = [" ".join(zones[z]["words"]) for z in zs]
-            return names, [], []
-        if ref_owner is not None and codes:
-            _zs, ws = collapse_owner(codes)
-            idxs = [i for i, w in enumerate(words) if w["word"] in ws]
-            return [], idxs, ws
-        return [], [], []
+    def resolve_by_words(ph_idx_list):
+        """把一组「原音频音素下标」解析成 (连读区名列表, 词下标列表, 词名列表)。
+
+        规则：只要落到的词里有在连读区里的，就整体按连读区呈现 ——
+        连读本来就切不开，硬拆反而误导（与旧 resolve 同旨）。
+        """
+        wis = sorted({ref_owner[j] for j in ph_idx_list if 0 <= j < len(ref_owner)})
+        if not wis:
+            return [], [], []
+        zone_ids = sorted({zone_by_word[wi] for wi in wis if wi in zone_by_word})
+        if zone_ids:
+            return [" ".join(zones[z]["words"]) for z in zone_ids], [], []
+        return [], wis, [word_bounds[wi]["word"] for wi in wis]
 
     diff_lines = []
     problem_words = []      # (词, 类型) 汇总
@@ -768,33 +970,21 @@ def main():
         if op == "replace":
             line = "  [替换] 应该读 %s  →  你读成了 %s" % (" ".join(ref[i1:i2]), " ".join(mine[j1:j2]))
             kind = "替换"
-            codes = ref_owner[i1:i2] if ref_owner is not None else None
-            if codes is None:
-                ws = word_indices(ref_word_idx[i1:i2], words)
-                zn, idxs, names = [], ws, [words[i]["word"] for i in ws]
-            else:
-                zn, idxs, names = resolve(codes)
+            zn, idxs, names = resolve_by_words(list(range(i1, i2)))
         elif op == "delete":
             line = "  [缺失] 你没读 %s（原音频里有）" % " ".join(ref[i1:i2])
             kind = "缺失"
-            codes = ref_owner[i1:i2] if ref_owner is not None else None
-            if codes is None:
-                ws = word_indices(ref_word_idx[i1:i2], words)
-                zn, idxs, names = [], ws, [words[i]["word"] for i in ws]
-            else:
-                zn, idxs, names = resolve(codes)
+            zn, idxs, names = resolve_by_words(list(range(i1, i2)))
         else:  # insert
-            # 你的录音和原音频时间轴不一定对齐，"多读"的音不能靠时间归属；
-            # 改用它出现在 diff 里的位置 —— 即相邻的两个原生词之间（不依赖时间）。
+            # 多读出来的音在原音频里没有对应位置 → 就近挂到它前面那个音所属的词
             line = "  [多余] 你多读了 %s（原音频里没有）" % " ".join(mine[j1:j2])
             kind = "多余"
-            ws = word_indices(ref_word_idx[max(0, i1 - 1):i1 + 1], words)
-            zn, idxs, names = [], ws, [words[i]["word"] for i in ws]
-        label = format_words(idxs, words, zone_names=zn if zn else None)
+            zn, idxs, names = resolve_by_words([max(0, i1 - 1)])
+        label = format_words(idxs, word_bounds, zone_names=zn if zn else None)
         if label:
             line = line + "   " + label
             for i in idxs:
-                problem_words.append((words[i]["word"], kind))
+                problem_words.append((word_bounds[i]["word"], kind))
             for nm in zn:
                 zone_hits.setdefault(nm, {"词": nm.split(" "), "n": 0})
                 zone_hits[nm]["n"] += 1
@@ -825,7 +1015,7 @@ def main():
     # 写一份"给人看"的纯文本报告（json 留给机器/AI）
     log_step("写报告与数据")
     try:
-        write_report(ref, mine, sm, words, ratio, diff_items, problem_words)
+        write_report(ref, mine, sm, word_bounds, ratio, diff_items, problem_words)
         out("")
         out("报告（人看）：音素对比_报告.txt")
         out("数据（机器）：音素对比.json")
@@ -833,9 +1023,8 @@ def main():
         log("（写报告失败：%s）" % e, show=True)
 
     # 词切分：连读区 / 碎片词 / 每个词分到几个音素。
-    # 只增不改 —— "词表"（含时间戳）逐字保留，后期做"哪个词读快/读慢、调高/调低"时要用。
     word_split = {}
-    if words:
+    if word_bounds:
         word_split = {
             "最小词长ms": MIN_WORD_MS,
             "碎片词": [{"word": sp["word"], "start_ms": sp["start_ms"],
@@ -846,20 +1035,39 @@ def main():
             "连读区": [{"词": z["words"], "start_ms": z["start_ms"], "end_ms": z["end_ms"],
                         "n_ph": z["n_ph"],
                         "归词音素数": [[spans[m]["word"], spans[m]["n_ph"]] for m in z["member_idx"]],
-                        "说明": "%s 处连读，讯飞词边界不可靠，按整体看" % " ".join(z["words"])}
+                        "说明": "%s 处连读，按整体看" % " ".join(z["words"])}
                        for z in zones],
             "命中差异的连读区": list(zone_hits.values()),
             "词音素分布": [{"word": sp["word"], "n_ph": sp["n_ph"],
                             "span_ms": sp["span_ms"]} for sp in spans],
         }
 
+    # 单词错误（标注层，不进综合分。基准 = 原音频实际音素，见 compute_word_errors）
+    word_errors = compute_word_errors(word_bounds, ref, ref_owner, mine, my_owner) if word_bounds else []
+
+    # 词块：节奏脚本的唯一计时输入（两侧都要）
+    word_blocks = {
+        "原音频": [{"词": sp["word"], "start_ms": sp["start_ms"], "end_ms": sp["end_ms"],
+                    "连读": sp["idx"] in zone_by_word,
+                    "角色": word_bounds[sp["idx"]].get("角色") if sp["idx"] < len(word_bounds) else None}
+                   for sp in spans],
+        "我的": [{"词": sp["word"], "start_ms": sp["start_ms"], "end_ms": sp["end_ms"],
+                  "连读": sp["idx"] in my_zone_words,
+                  "角色": word_bounds[sp["idx"]].get("角色") if sp["idx"] < len(word_bounds) else None}
+                 for sp in spans_my],
+    }
+
     try:
         with open(OUT_JSON, "w", encoding="utf-8") as f:
             json.dump({"原音频": ref, "我的模仿": mine,
                        "相似度": ratio, "对齐统计": align_stat,
                        "差异": diff_lines,
-                       "词表": words,
-                       "词切分": word_split}, f, ensure_ascii=False, indent=2)
+                       # 词表去掉 start_ms/end_ms —— 时间上移到「词块」
+                       "词表": [{"word": wb["word"], "角色": wb.get("角色")} for wb in word_bounds],
+                       "词切分": word_split,
+                       "词块": word_blocks,
+                       "单词错误": word_errors or None,
+                       "参考音素可用": bool(ref_data)}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
