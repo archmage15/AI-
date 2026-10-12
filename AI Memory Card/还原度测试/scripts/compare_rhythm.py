@@ -3,16 +3,17 @@ r"""还原度对比 · 第一块：节奏 / 重音
 
 数据来源分两条线，各管各的：
 
-  节奏（讯飞词级时间戳）
-    - 词块配对：按【词序号】一一对应，绝不拿绝对秒数相减（两段录音时间轴不匹配）
-    - 词块时长：讯飞给初值，用【能量实证】复核；差得离谱时以实证为准
-    - 停顿    ：只在【句子边界】判（词与词之间正常就是连着走的，不算停顿）
-    - 整句净时长：首词 start -> 末词 end
+  节奏（词块时间来自 音素对比.json.词块 —— 09-28 块 10 起去讯飞）
+    - 词块配对：按【词块序号】一一对应（两侧按"任一侧连读即对称合并"，块数恒相等）
+    - 词块时长：CTC 帧给的 span（音素起点到起点+20ms）；用【能量实证】复核，差得离谱时以实证为准
+    - 停顿    ：块与块之间的 gap；【换人处】的 gap 标"预期停顿"，不计入处数（§5.5）
+    - 整句净时长：首块 start -> 末块 end
+    - ⚠️ 必须先跑 compare_phoneme.py（产出 音素对比.json），本脚本才有输入
 
-  重音（音频信号，各侧自比）
-    - 每块算 响度峰值 / 音高均值，各自与【本侧】全句均值比（不跨侧比绝对值，
-      因为两段录音的电平本来就不一样）
-    - 超过 本侧均值 × STRESS_X 即判为突出；响度或音高任一过线就算
+  重音（音频信号，各侧自比；09-28 块 10 起按【角色】分组）
+    - 每块算 响度峰值 / 音高均值，与【本侧同角色组】的均值比（不跨侧、不跨角色比绝对值，
+      因为两段录音的电平本来就不一样，两人对话时全句统计量也不成立）
+    - 超过 组内基准 × STRESS_X 即判为突出；响度或音高任一过线就算
     - 两侧的"突出块序号集合"对比 -> 漏 / 多 / 命中
     - 只报差异，不下"你错了"的结论（对错取决于说话意图，机器判不了）
 
@@ -25,19 +26,13 @@ r"""还原度对比 · 第一块：节奏 / 重音
   audio\   放录音（你手动放，只读）
   output\  放本次结果（自动生成，可随时清空）
 
-依赖：soundfile / numpy / matplotlib / requests
+依赖：soundfile / numpy / matplotlib（09-28 起不再依赖 requests）
 
 注：语调（F0 音高走向）本次暂不出分，等判分标准重做后再接回来。
 """
-import base64
-import hashlib
-import hmac
 import json
 import os
 import sys
-import tempfile
-import time
-from urllib.parse import urlencode
 
 import numpy as np
 
@@ -59,10 +54,8 @@ REF_FILE = os.path.join(SRC_DIR, "原音频.wav")
 MY_FILE = os.path.join(SRC_DIR, "模仿.wav")
 OUT_PNG = os.path.join(OUT_DIR, "节奏对比.png")
 OUT_JSON = os.path.join(OUT_DIR, "节奏对比.json")   # 给机器/综合评分器用
-PHONEME_JSON = os.path.join(OUT_DIR, "音素对比.json")  # 读连读区（本脚本不写它）
-
-XF_CONFIG = os.path.join(ROOT, "讯飞配置.json")
-XF_HOST = "https://raasr.xfyun.cn/v2/api"
+# 本脚本的唯一词块时间来源：compare_phoneme.py 的产出（09-28 块 10 起，去讯飞）
+PHONEME_JSON = os.path.join(OUT_DIR, "音素对比.json")
 
 SR = 16000
 FRAME_MS = 25
@@ -139,183 +132,118 @@ def pitch_contour(y, fmin=70, fmax=400):
     return np.array(f0)
 
 
-# ================= 讯飞转写（拿词级时间戳） =================
-def xf_make_signa(appid, secret_key, ts):
-    """讯飞 LFASR v2 签名：base64(HMAC-SHA1(secret_key, md5(appid+ts)))"""
-    md5_hex = hashlib.md5((appid + ts).encode("utf-8")).hexdigest()
-    raw = hmac.new(secret_key.encode("utf-8"), md5_hex.encode("utf-8"),
-                   hashlib.sha1).digest()
-    return base64.b64encode(raw).decode("utf-8")
+# ================= 词块读入（来自 音素对比.json.词块，09-28 块 10 起） =================
+def load_blocks():
+    """读 compare_phoneme.py 产出的 词块，两侧对称合并连读区，返回
+    (blocks_r, blocks_m, words_r, words_m)。读不到 → 抛异常（main 里降级退出）。
 
-
-def xf_prepare_audio(src_path):
-    """转成 16kHz 单声道 wav（讯飞常规要求），返回 (临时文件路径, 时长秒)。"""
-    import soundfile as sf
-    audio, sr = sf.read(src_path, dtype="float32", always_2d=True)
-    audio = audio.mean(axis=1)
-    if sr != SR:
-        n_out = int(round(len(audio) * SR / sr))
-        x_in = np.linspace(0, 1, len(audio), endpoint=False)
-        x_out = np.linspace(0, 1, n_out, endpoint=False)
-        audio = np.interp(x_out, x_in, audio).astype(np.float32)
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", dir=OUT_DIR, delete=False)
-    tmp.close()
-    sf.write(tmp.name, audio, SR, subtype="PCM_16")
-    return tmp.name, len(audio) / SR
-
-
-def xf_collect_words(node, bg, out_words):
-    """递归收集带 cw/wb/we 的词节点；绝对时间 = bg + 帧*10ms。"""
-    if isinstance(node, dict):
-        if "cw" in node and ("wb" in node or "we" in node):
-            wb = int(node.get("wb") or 0)
-            we = int(node.get("we") or 0)
-            for c in node.get("cw") or []:
-                w = (c.get("w") or "").strip()
-                if w and c.get("wp") != "p":
-                    out_words.append({"word": w,
-                                      "start_ms": bg + wb * 10,
-                                      "end_ms": bg + we * 10})
-        for v in node.values():
-            xf_collect_words(v, bg, out_words)
-    elif isinstance(node, list):
-        for v in node:
-            xf_collect_words(v, bg, out_words)
-
-
-def xf_parse_order_result(text):
-    data = json.loads(text)
-    words = []
-    for seg in data.get("lattice", []):
-        one = json.loads(seg["json_1best"])
-        st = one.get("st", {})
-        bg = int(st.get("bg") or one.get("bg") or 0)
-        xf_collect_words(st, bg, words)
-    return words
-
-
-def transcribe_words(audio_path):
-    """对音频跑讯飞转写，返回 [{"word","start_ms","end_ms"}]；失败抛异常。"""
-    import requests
-    if not os.path.exists(XF_CONFIG):
-        raise RuntimeError("缺少配置文件 " + XF_CONFIG)
-    with open(XF_CONFIG, encoding="utf-8") as f:
-        cfg = json.load(f)
-    appid = (cfg.get("appid") or "").strip()
-    secret_key = (cfg.get("secret_key") or "").strip()
-    if not appid or not secret_key:
-        raise RuntimeError("讯飞配置.json 缺 appid / secret_key")
-
-    tmp_audio, duration_s = xf_prepare_audio(audio_path)
-    try:
-        ts = str(int(time.time()))
-        signa = xf_make_signa(appid, secret_key, ts)
-        params = {
-            "appId": appid, "signa": signa, "ts": ts,
-            "fileSize": os.path.getsize(tmp_audio),
-            "fileName": os.path.basename(tmp_audio),
-            "duration": str(int(round(duration_s))),
-        }
-        with open(tmp_audio, "rb") as f:
-            data = f.read()
-        resp = requests.post(XF_HOST + "/upload?" + urlencode(params),
-                             headers={"Content-type": "application/json"},
-                             data=data, timeout=60).json()
-        if resp.get("code") != "000000":
-            raise RuntimeError("上传失败：" + json.dumps(resp, ensure_ascii=False))
-        order_id = resp["content"]["orderId"]
-        for _ in range(60):
-            time.sleep(3)
-            r = requests.post(XF_HOST + "/getResult?" + urlencode({
-                "appId": appid, "signa": signa, "ts": ts,
-                "orderId": order_id, "resultType": "transfer"}), timeout=60).json()
-            if r.get("code") != "000000":
-                raise RuntimeError("查询失败：" + json.dumps(r, ensure_ascii=False))
-            info = r["content"].get("orderInfo", {})
-            status = info.get("status")
-            if status == 4:
-                return xf_parse_order_result(r["content"].get("orderResult"))
-            if status == -1:
-                raise RuntimeError("订单失败：" + json.dumps(info, ensure_ascii=False))
-        raise RuntimeError("转写超时")
-    finally:
-        try:
-            os.remove(tmp_audio)
-        except Exception:
-            pass
-
-
-# ================= 词块构建（连读区合并） =================
-def load_merge_zones():
-    """从 音素对比.json 取连读区，返回 [(词1, 词2), ...]。
-    连读在语言上切不开，整块看；这里复用音素脚本已识别好的结果。"""
+    ⚠️ 合并规则（排期 §5.5 / 计划书阶段 4）：
+      音素对比.json.词块 是**逐词**条目（带 连读 标记 + 角色）。节奏配对要的是块。
+      - 某词在**任一侧**被标 连读=True → 这个词段在**两侧**都并入连读块。
+        为什么取并集：两侧块数必须相等（序号对齐是配对的前提）；
+        而且连读块里的短词（如 are 只有 20ms=1 帧）单独成块时是纯测量噪声，
+        并进大块才能把噪声摊掉。
+      - 实测本例：原音频有 Where+are / oh+im / at+the，我的有 still+at
+        → 并集后 13 词 → 9 块/侧（still+at+the 并成一块）。
+    """
     if not os.path.exists(PHONEME_JSON):
-        return []
-    try:
-        with open(PHONEME_JSON, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return []
-    zones = []
-    for z in (data.get("词切分", {}).get("连读区") or []):
-        ws = z.get("词") or []
-        if len(ws) >= 2:
-            zones.append(tuple(ws))
-    return zones
+        raise RuntimeError("缺少 " + PHONEME_JSON + " —— 请先跑 compare_phoneme.py"
+                           "（或直接双击 一键跑还原度.bat）")
+    with open(PHONEME_JSON, encoding="utf-8") as f:
+        data = json.load(f)
+    word_lists = (data.get("词块") or {}).get("原音频"), (data.get("词块") or {}).get("我的")
+    if not word_lists[0] or not word_lists[1]:
+        raise RuntimeError("音素对比.json 里没有 词块（或为空）—— 请重跑 compare_phoneme.py")
 
+    # 词表输出用：逐词条目原样保留（带时间）
+    words_r = [dict(w) for w in word_lists[0]]
+    words_m = [dict(w) for w in word_lists[1]]
+    n = min(len(words_r), len(words_m))
 
-def build_blocks(words, zones):
-    """把词序列按连读区合并成块，返回 [{"词":[...], "start_ms", "end_ms", "连读"}]。
-    块的位置由词在序列中的次序决定 —— 全程只用序号，不用绝对秒数。"""
-    used = [False] * len(words)
-    blocks = []
-    i = 0
-    while i < len(words):
-        if used[i]:
-            i += 1
-            continue
-        matched = None
-        for zone in zones:
-            if i + len(zone) <= len(words):
-                if tuple(w["word"] for w in words[i:i + len(zone)]) == zone:
-                    matched = zone
-                    break
-        if matched:
-            grp = words[i:i + len(matched)]
-            blocks.append({"词": [w["word"] for w in grp],
-                           "start_ms": grp[0]["start_ms"],
-                           "end_ms": grp[-1]["end_ms"],
-                           "连读": True})
-            for k in range(i, i + len(matched)):
-                used[k] = True
-            i += len(matched)
+    # 连读区合并：两侧各自的 zone（连续 连读=True 段）取**区间并集**，
+    # **只重叠才并、相邻不并**（跨侧共享词下标才算同一块）。
+    #   例：原音频有 at+the[10,11]、我的有 still+at[9,10] —— 共享词 10 → 并成 [9,11]；
+    #   但 oh+im[7,8] 和 still+at+the[9,11] 相邻（8 和 9）不重叠 → 保持两块。
+    #   ⚠️ 旧实现用"逐词标记取并集"会把相邻的也粘成一块（曾把 oh+im+still+at+the
+    #   错误合成 5 词一块），已修。
+    def collect_zones(words):
+        zs, i = [], 0
+        while i < n:
+            if words[i].get("连读"):
+                j = i
+                while j + 1 < n and words[j + 1].get("连读"):
+                    j += 1
+                if j > i:
+                    zs.append((i, j))
+                i = j + 1
+            else:
+                i += 1
+        return zs
+
+    raw_zones = sorted(collect_zones(words_r) + collect_zones(words_m))
+    zones = []          # 合并后的 [(a, b)]，闭区间
+    for a, b in raw_zones:
+        if zones and a <= zones[-1][1]:    # 与上一区间重叠（共享词下标）
+            zones[-1] = (zones[-1][0], max(zones[-1][1], b))
         else:
-            blocks.append({"词": [words[i]["word"]],
-                           "start_ms": words[i]["start_ms"],
-                           "end_ms": words[i]["end_ms"],
-                           "连读": False})
-            used[i] = True
-            i += 1
-    return blocks
+            zones.append((a, b))
+
+    zone_start = {a: (a, b) for a, b in zones}
+
+    def to_blocks(words):
+        blocks = []
+        i = 0
+        while i < n:
+            if i in zone_start:
+                a, b = zone_start[i]
+                grp = words[a:b + 1]
+                blocks.append({"词": [w["词"] for w in grp],
+                               "start_ms": grp[0]["start_ms"],
+                               "end_ms": grp[-1]["end_ms"],
+                               "连读": True,
+                               "角色": grp[0].get("角色")})
+                i = b + 1
+            else:
+                w = words[i]
+                blocks.append({"词": [w["词"]],
+                               "start_ms": w["start_ms"],
+                               "end_ms": w["end_ms"],
+                               "连读": False,
+                               "角色": w.get("角色")})
+                i += 1
+        return blocks
+
+    return to_blocks(words_r), to_blocks(words_m), words_r, words_m
 
 
 def block_span(block):
     return (block["end_ms"] - block["start_ms"]) / 1000.0
 
 
-# ================= 停顿（只判句子边界） =================
-def find_boundary_pauses(words):
-    """词间空隙 >= 阈值处记为停顿候选。
-    注：正常口语词与词之间本就是连着走的，这里只作为"句子边界"的候选信号，
-        报告里统称"停顿"，不逐词报"第几个词后停了几秒"。"""
+# ================= 停顿（块间 gap；换人处单独标） =================
+def find_boundary_pauses(blocks):
+    """块与块之间的空隙 >= 阈值处记为停顿候选。
+
+    09-28 块 10 两处改动（计划书阶段 4 + 排期 §5.5 连带坑）：
+    1. 输入从「讯飞逐词」换成「合并后的词块」—— gap 是块 span 之间的真实空隙。
+    2. **换人处**（相邻块角色不同，如 Terry(A) -> oh+im(B)）的 gap 标
+       「预期停顿」并**不计入处数** —— 两人对话轮流说，那里本来就该停，
+       拿它扣"多余停顿"是误判（§5.5 连带坑，本例实测原音频换人 gap 880ms、
+       我的 680ms，旧口径下会全部被记成停顿错误）。
+    """
     result = []
-    for i in range(len(words) - 1):
-        gap = (words[i + 1]["start_ms"] - words[i]["end_ms"]) / 1000.0
-        if gap >= BOUNDARY_GAP_S:
-            result.append({"after_word": words[i]["word"],
-                           "after_index": i + 1,
-                           "gap": round(gap, 3)})
-    return result
+    for i in range(len(blocks) - 1):
+        gap = (blocks[i + 1]["start_ms"] - blocks[i]["end_ms"]) / 1000.0
+        if gap < BOUNDARY_GAP_S:
+            continue
+        role_now = blocks[i].get("角色")
+        role_next = blocks[i + 1].get("角色")
+        is_turn = bool(role_now and role_next and role_now != role_next)
+        result.append({"after_word": "+".join(blocks[i]["词"]),
+                       "after_index": i + 1,
+                       "gap": round(gap, 3),
+                       "换人处": is_turn})
+    return result, [p for p in result if not p["换人处"]]
 
 
 # ================= 时长复核（能量实证） =================
@@ -331,12 +259,14 @@ def measure_voiced(env, block):
 
 
 def resolve_duration(block, env):
-    """讯飞时长 vs 能量实证：差得离谱时以实证为准（讯飞词边界是猜的，会虚高）。"""
+    """块时长 vs 能量实证：差得离谱时以实证为准（块时长来自 CTC 帧，09-28 起标签改名）。
+    注：FIX_TOLERANCE_S=0.15 是讯飞时代定的（讯飞边界虚高才会差那么多）；
+       CTC span 是音素起点拼的、偏紧，这道复核现在很少触发，留着当护栏。"""
     span = block_span(block)
     voiced = measure_voiced(env, block)
     if voiced > 0 and abs(span - voiced) > FIX_TOLERANCE_S:
         return voiced, "实证", span, voiced
-    return span, "讯飞", span, voiced
+    return span, "CTC帧", span, voiced
 
 
 # ================= 重音（信号，各侧自比） =================
@@ -375,61 +305,112 @@ def detrend_linear(values):
     return out
 
 
-def mark_stress(feats, x, detrend=True):
-    """各侧自比：某块 响度/音高 超过【本侧】均值 × x 即算突出；任一过线即为突出块。
-    返回 (突出块序号列表, 逐块明细)。"""
+def mark_stress(feats, x, detrend=True, roles=None):
+    """各侧自比：某块 响度/音高 超过【基准】× x 即算突出；任一过线即为突出块。
+    返回 (突出块序号列表, 逐块明细)。
+
+    09-28 块 10 改动（排期 §5.5）：**基准按【角色】分组算** ——
+    两人对话时全句统计量不成立（风险 22），A 的提问段和 B 的回答段
+    响度/音高本来就不在一个水平上，混在一起会把"A 段天然响"误判成"突出"。
+    组内样本太少（<2 个有效值）时退回全句基准（防 3 块的组算不出 std）。
+    roles 为 None 时保持旧行为（单组）。
+    """
     louds = [f["响度"] for f in feats]
     pitches_raw = [f["音高"] for f in feats]
 
     louds_use = detrend_linear(louds) if detrend else louds
     pitches_use = detrend_linear(pitches_raw) if detrend else pitches_raw
 
-    valid_loud = [v for v in louds_use if v is not None]
-    valid_pitch = [v for v in pitches_use if v is not None]
-    # 去趋势后均值为 0 附近，改用"有效值均值 + 标准差"作基准，否则阈值无意义
-    mean_loud = float(np.mean(valid_loud)) if valid_loud else 0.0
-    std_loud = float(np.std(valid_loud)) if len(valid_loud) > 1 else 0.0
-    mean_pitch = float(np.mean(valid_pitch)) if valid_pitch else 0.0
-    std_pitch = float(np.std(valid_pitch)) if len(valid_pitch) > 1 else 0.0
+    def baseline(idxs):
+        """给一组下标算 (均值+偏移阈值) 基准；样本不足时返回 None。"""
+        vl = [louds_use[i] for i in idxs if louds_use[i] is not None]
+        vp = [pitches_use[i] for i in idxs if pitches_use[i] is not None]
+        if len(vl) < 2 and len(vp) < 2:
+            return None
+        ml = float(np.mean(vl)) if vl else 0.0
+        sl = float(np.std(vl)) if len(vl) > 1 else 0.0
+        mp = float(np.mean(vp)) if vp else 0.0
+        sp = float(np.std(vp)) if len(vp) > 1 else 0.0
+        return ml, sl, mp, sp
+
+    all_idx = list(range(len(feats)))
+    groups = {}
+    if roles:
+        for i, r in enumerate(roles):
+            groups.setdefault(r or "?", []).append(i)
+    else:
+        groups["*"] = all_idx
+
+    base_all = baseline(all_idx)          # 兜底基准（全句）
+    base_of = {}                          # 组下标 -> 该组基准
+    for r, idxs in groups.items():
+        base_of.update({i: (baseline(idxs) or base_all) for i in idxs})
 
     marked, detail = [], []
     for i, f in enumerate(feats):
+        ml, sl, mp, sp = base_of.get(i) or base_all
         flags = []
         lv = louds_use[i]
         pv = pitches_use[i]
-        if lv is not None and std_loud > 0 and lv > mean_loud + (x - 1.0) * std_loud * 3:
+        if lv is not None and sl > 0 and lv > ml + (x - 1.0) * sl * 3:
             flags.append("响")
-        if pv is not None and std_pitch > 0 and pv > mean_pitch + (x - 1.0) * std_pitch * 3:
+        if pv is not None and sp > 0 and pv > mp + (x - 1.0) * sp * 3:
             flags.append("高")
         if flags:
             marked.append(i + 1)
         detail.append({"序号": i + 1,
                        "词": "+".join(f.get("词", [])) if "词" in f else "",
+                       "角色": (roles[i] if roles and i < len(roles) else None),
+                       "响度": None if lv is None else round(float(lv), 4),
+                       "音高": None if pv is None else round(float(pv), 2),
                        "命中": flags})
     return marked, detail
 
 
-# ---------------- DTW 距离（保留，供后续语调使用） ----------------
-def dtw_distance(a, b):
-    if len(a) == 0 or len(b) == 0:
-        return float("nan")
-    a = (a - a.min()) / (a.max() - a.min() + 1e-9)
-    b = (b - b.min()) / (b.max() - b.min() + 1e-9)
-    n, m = len(a), len(b)
-    D = np.full((n + 1, m + 1), np.inf)
-    D[0, 0] = 0.0
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            c = abs(a[i - 1] - b[j - 1])
-            D[i, j] = c + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
-    return D[n, m] / max(n, m)
-
-
 # ---------------- 节奏分 ----------------
+# ---- 打分参数（09-28 新增）----
+# 逐块相对差 → 节奏分的汇总方式。
+#   power = 1.0 → 算术平均（旧行为）—— 对「某一处崩了」**不敏感**：
+#                 10 块里坏 2 块，会被其余 8 块摊平。
+#   power = 3.0 → 幂平均，对大的偏差加权更重，比 max 抗噪、比 mean 敏感。
+# ⚠️ 这个 3.0 **尚未标定**（目前只有 1 句 / 13 词的样本）。换样本后需重标。
+AGG_POWER = 3.0
+
+
+def aggregate_penalty(diffs, power=AGG_POWER):
+    """把逐块偏差汇总成一个惩罚量（0~1）。幂平均：p=1 退化为算术平均。"""
+    x = np.clip(np.abs(np.asarray(diffs, dtype=float)), 0.0, 1.0)
+    if len(x) == 0:
+        return 0.0
+    return float((np.mean(x ** power)) ** (1.0 / power))
+
+
 def score_blocks(pairs):
     """按块算相对差，给每块一个判定；再汇总成节奏分。
-    节奏分 = 100 - 每块相对差（截断到 1.0）的平均值 × 100，最低 0 分。"""
+
+    节奏分 = (1 − 汇总惩罚) × 100，最低 0 分。汇总用幂平均（见 AGG_POWER）。
+
+    ⚠️ 09-28 两处改动（原因见计划书 §4.5.4 / §4.5.6）：
+
+    1. **打分先归一化**。每块时长先除以「本侧块时长总和」，再算相对差。
+       为什么必须这样：旧版拿**绝对**块时长比 `(我−原)/原`，若对方只是**整体**
+       说慢了 17.6%，则**每一块**都是 +17.6% → 被判成"每块都读错"。
+       计划书风险 20 曾断言「分母同步变化 → 对均匀变速天然免疫」——
+       **该推理有误**：分母是"该块自己的基准时长"，不随变体变化，整体缩放消不掉。
+       （实测：S1 只是慢 15%，旧版却给 88.8；设计意图应为 ≈100。）
+
+    2. **汇总改幂平均**（旧为算术平均）。算术平均结构上表达不出「某一处崩了」：
+       S3 的 10 块里只有 2 块坏（−38% / −47%），被其余 8 块 0% 一平摊，
+       扣分只剩 11% → 88.9 分，比"只是慢了"的 S1 还高。
+
+    ⚠️ 逐块提示（items 里的 `相对差` / `判定`）仍按**绝对**块时长算 ——
+       它回答的是"这块比基准快/慢多少"，与"整体语速"是两件事，
+       由 `整句净时长` 字段单独报告。**只有打分走归一化。**
+    """
     items = []
+    norms = []
+    total_r = sum(p["原音频时长"] for p in pairs if p["原音频时长"] > 0)
+    total_m = sum(p["我的时长"] for p in pairs if p["原音频时长"] > 0)
     for p in pairs:
         dr, dm = p["原音频时长"], p["我的时长"]
         if dr <= 0:
@@ -444,9 +425,14 @@ def score_blocks(pairs):
         items.append({"序号": p["序号"], "块": p["块"], "连读": p["连读"],
                       "原音频时长": round(dr, 3), "我的时长": round(dm, 3),
                       "相对差": round(rel, 4), "判定": verdict})
+        # 归一化相对差：占本侧块时长总和的比例，再比
+        if total_r > 0 and total_m > 0:
+            norms.append((dm / total_m - dr / total_r) / (dr / total_r))
+        else:
+            norms.append(rel)
     if not items:
         return items, 0.0
-    penalty = np.mean([min(abs(it["相对差"]), 1.0) for it in items])
+    penalty = aggregate_penalty(norms)
     return items, max(0.0, (1 - penalty) * 100)
 
 
@@ -485,29 +471,48 @@ def plot_blocks(items, title="节奏对比（按词块序号）"):
 
 
 def write_json(net_r, net_m, pauses_r, pauses_m, items, rhythm_score,
-               stress_r, stress_m, blocks_r, blocks_m, words_r, words_m):
+               stress_r, stress_m, blocks_r, blocks_m, words_r, words_m,
+               detail_r, detail_m):
     """写 节奏对比.json —— 给机器/综合评分器读。
     注：字段「节奏分」保持不变（overall_score.py 按这个名字读）；
-       「语调分」本次不产出（语调整理中），overall_score.py 会自动跳过缺项。"""
+       「语调分」本次不产出（语调整理中），overall_score.py 会自动跳过缺项。
+    ⚠️ 顶层键「节奏_讯飞」**名字保留**（09-28 去讯飞后已是历史名，但
+       overall_score.py 读它 —— 键名是下游依赖，不能随手改），
+       内部加「数据源」字段说明真实来源。
+    """
     nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r)}
     nm = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_m)}
     miss = sorted(set(stress_r) - set(stress_m))
     extra = sorted(set(stress_m) - set(stress_r))
     hit = sorted(set(stress_r) & set(stress_m))
 
+    # 停顿：换人处的 gap 不算错误（§5.5 预期停顿），处数只数非换人的
+    def pause_part(pauses):
+        turns = [p for p in pauses if p.get("换人处")]
+        normal = [p for p in pauses if not p.get("换人处")]
+        return normal, turns
+
+    normal_r, turns_r = pause_part(pauses_r)
+    normal_m, turns_m = pause_part(pauses_m)
+
     data = {
         "节奏_讯飞": {
+            "数据源": "音素对比.json.词块（CTC 帧，09-28 块 10 起去讯飞；键名为兼容保留）",
             "整句净时长": {"原音频": round(net_r, 3), "我的": round(net_m, 3),
                            "相对差": round((net_m - net_r) / net_r, 4) if net_r > 0 else 0},
             "词块数": {"原音频": len(blocks_r), "我的": len(blocks_m)},
             "序号对齐风险": (len(blocks_r) != len(blocks_m)),
             "句子边界停顿": {
-                "原音频处数": len(pauses_r), "我的处数": len(pauses_m),
-                "原音频": pauses_r, "我的": pauses_m,
+                "原音频处数": len(normal_r), "我的处数": len(normal_m),
+                "原音频": normal_r, "我的": normal_m,
+                "换人处_预期停顿": {"原音频": turns_r, "我的": turns_m},
+                "说明": "换人处（角色切换）的停顿是预期的，不计入处数（排期 §5.5）",
             },
             "词块时长": items,
         },
         "重音_信号": {
+            "方法": "各侧自比·去趋势·组内均值+k×σ（09-28 起按【角色】分组算基准）",
+            "分组": "角色",
             "阈值X": STRESS_X,
             "去趋势": DETREND,
             "原音频突出块": [{"序号": i, "块": nr.get(i, "?")} for i in stress_r],
@@ -515,6 +520,7 @@ def write_json(net_r, net_m, pauses_r, pauses_m, items, rhythm_score,
             "漏（原音频有）": [{"序号": i, "块": nr.get(i, "?")} for i in miss],
             "多（我的）": [{"序号": i, "块": nm.get(i, "?")} for i in extra],
             "命中": [{"序号": i, "块": nr.get(i, "?")} for i in hit],
+            "逐块明细": {"原音频": detail_r, "我的": detail_m},
             "说明": "跟原音频比结构，不下对错结论（对错取决于说话意图）",
         },
         "词表": {"原音频": words_r, "我的": words_m},
@@ -550,81 +556,83 @@ def main():
     env_r, env_m = frame_rms(ref), frame_rms(mine)
     f0_r, f0_m = pitch_contour(ref), pitch_contour(mine)
 
-    # ---- 讯飞转写 ----
-    log_step("讯飞转写（拿词级时间戳）")
+    # ---- 读词块（来自 音素对比.json，09-28 块 10 起去讯飞）----
+    log_step("读词块（音素对比.json.词块）")
     try:
-        words_r = transcribe_words(REF_FILE)
-        words_m = transcribe_words(MY_FILE)
-        log("   原音频 %d 词 ｜ 我的 %d 词" % (len(words_r), len(words_m)),
-            verbose=True)
+        blocks_r, blocks_m, words_r, words_m = load_blocks()
+        log("   原音频 %d 块 ｜ 我的 %d 块（合并连读后）"
+            % (len(blocks_r), len(blocks_m)), verbose=True)
     except Exception as e:
         out("")
-        out("X 讯飞转写失败，本次节奏对比无法进行：")
+        out("X 读词块失败，本次节奏对比无法进行：")
         out("    " + str(e))
-        out("  （检查 讯飞配置.json / 网络 / 额度）")
-        # 降级：仍出一份"只有信号侧"的结果，但节奏分留空
+        out("  （先双击 一键跑还原度.bat 让 compare_phoneme.py 跑出 音素对比.json）")
         log_error(str(e))
         try:
-            write_json(0, 0, [], [], [], 0.0, [], [], [], [], words_r if 'words_r' in dir() else [], [])
+            write_json(0, 0, [], [], [], 0.0, [], [], [], [], [], [], [], [])
         except Exception:
             pass
-        log_done("（讯飞不可用，提前退出）")
+        log_done("（缺词块输入，提前退出）")
         return
 
-    zones = load_merge_zones()
-    if zones:
-        log("   连读区：" + "、".join("+".join(z) for z in zones), verbose=True)
-
-    blocks_r = build_blocks(words_r, zones)
-    blocks_m = build_blocks(words_m, zones)
-
-    # ---- 词块配对（按序号）----
+    # ---- 词块配对（按序号，两侧块数恒相等）----
     log_step("词块配对（按序号）")
     pairs = []
-    n = max(len(blocks_r), len(blocks_m))
+    n = min(len(blocks_r), len(blocks_m))
     for i in range(n):
-        br = blocks_r[i] if i < len(blocks_r) else None
-        bm = blocks_m[i] if i < len(blocks_m) else None
-        if br is None or bm is None:
-            continue
-        dr, src_r, span_r, _ = resolve_duration(br, env_r)
-        dm, src_m, span_m, _ = resolve_duration(bm, env_m)
+        br, bm = blocks_r[i], blocks_m[i]
+        dr, src_r, _span_r, _ = resolve_duration(br, env_r)
+        dm, src_m, _span_m, _ = resolve_duration(bm, env_m)
         pairs.append({"序号": i + 1,
                       "块": "+".join(br["词"]),
                       "连读": br["连读"],
+                      "角色": br.get("角色"),
                       "原音频时长": dr, "我的时长": dm,
                       "原音频时长来源": src_r, "我的时长来源": src_m})
 
-    # ---- 句子边界停顿 ----
-    pauses_r = find_boundary_pauses(words_r)
-    pauses_m = find_boundary_pauses(words_m)
+    # ---- 停顿（块间 gap；换人处单独标）----
+    pauses_r_all, pauses_r = find_boundary_pauses(blocks_r)
+    pauses_m_all, pauses_m = find_boundary_pauses(blocks_m)
+    turns_r = [p for p in pauses_r_all if p["换人处"]]
+    turns_m = [p for p in pauses_m_all if p["换人处"]]
 
-    # ---- 重音 ----
-    log_step("重音判定（各侧自比）")
+    # ---- 重音（按角色分组算基准，09-28 块 10）----
+    log_step("重音判定（各侧自比·按角色分组）")
     feats_r = block_signal_features(env_r, f0_r, blocks_r)
     feats_m = block_signal_features(env_m, f0_m, blocks_m)
     for i, b in enumerate(blocks_r):
         feats_r[i]["词"] = b["词"]
     for i, b in enumerate(blocks_m):
         feats_m[i]["词"] = b["词"]
-    marked_r, _ = mark_stress(feats_r, STRESS_X, DETREND)
-    marked_m, _ = mark_stress(feats_m, STRESS_X, DETREND)
+    roles_r = [b.get("角色") for b in blocks_r]
+    roles_m = [b.get("角色") for b in blocks_m]
+    marked_r, detail_r = mark_stress(feats_r, STRESS_X, DETREND, roles_r)
+    marked_m, detail_m = mark_stress(feats_m, STRESS_X, DETREND, roles_m)
 
-    # ---- 节奏分 ----
+    # ---- 节奏分（score_blocks 内部已归一化 + 幂平均 p=3）----
     items, rhythm_score = score_blocks(pairs)
+    for i, it in enumerate(items):
+        if i < len(blocks_r):
+            it["角色"] = blocks_r[i].get("角色")
 
     # ---- 终端简报 ----
-    net_r = (words_r[-1]["end_ms"] - words_r[0]["start_ms"]) / 1000.0
-    net_m = (words_m[-1]["end_ms"] - words_m[0]["start_ms"]) / 1000.0
+    net_r = (blocks_r[-1]["end_ms"] - blocks_r[0]["start_ms"]) / 1000.0
+    net_m = (blocks_m[-1]["end_ms"] - blocks_m[0]["start_ms"]) / 1000.0
 
     out("")
     out("整句净时长：原音频 %.2fs   |   我的 %.2fs   |   相对差 %+.1f%%"
         % (net_r, net_m, (net_m - net_r) / net_r * 100 if net_r > 0 else 0))
-    out("句子边界停顿：原音频 %d 处   |   我的 %d 处"
+    out("句子边界停顿：原音频 %d 处   |   我的 %d 处   （换人处已排除，单独列出）"
         % (len(pauses_r), len(pauses_m)))
     for label, ps in (("原音频", pauses_r), ("我的", pauses_m)):
         for p in ps:
             out("   [%s] \"%s\" 后停了 %.2fs" % (label, p["after_word"], p["gap"]))
+    if turns_r or turns_m:
+        out("   换人处预期停顿（不计入处数）：")
+        for p in turns_r:
+            out("     [原音频] \"%s\" 后 %.2fs（换人）" % (p["after_word"], p["gap"]))
+        for p in turns_m:
+            out("     [我的]   \"%s\" 后 %.2fs（换人）" % (p["after_word"], p["gap"]))
     out("")
     if len(blocks_r) != len(blocks_m):
         out("⚠ 两侧词块数不一致（%d vs %d），序号可能错位，结果仅供参考"
@@ -632,13 +640,14 @@ def main():
     out("词块时长对比（横轴=序号，不卡点）：")
     for it in items:
         tag = " [连读]" if it["连读"] else ""
-        out("   #%-2d %-16s 原音频 %.2fs | 我 %.2fs | %+.1f%%  %s%s"
+        role = " [%s]" % it.get("角色") if it.get("角色") else ""
+        out("   #%-2d %-16s 原音频 %.2fs | 我 %.2fs | %+.1f%%  %s%s%s"
             % (it["序号"], it["块"], it["原音频时长"], it["我的时长"],
-               it["相对差"] * 100, it["判定"], tag))
+               it["相对差"] * 100, it["判定"], tag, role))
     out("")
     nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r)}
     nm = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_m)}
-    out("重音落点（跟原音频比结构，不下对错结论）：")
+    out("重音落点（按角色分组自比，跟原音频比结构，不下对错结论）：")
     out("   原音频：" + ("、".join("#%d %s" % (i, nr[i]) for i in marked_r)
                        or "（无）"))
     out("   我的：  " + ("、".join("#%d %s" % (i, nm[i]) for i in marked_m)
@@ -652,7 +661,7 @@ def main():
                                               for i in extra) or "无"))
     out("   → 命中：" + ("、".join("#%d %s" % (i, nr[i]) for i in hit) or "无"))
     out("")
-    out("节奏分：%.1f / 100" % rhythm_score)
+    out("节奏分：%.1f / 100  （归一化+幂平均 p=3，见 score_blocks）" % rhythm_score)
     out("语调分：暂不出（判分标准重做中）")
     out("")
 
@@ -664,8 +673,9 @@ def main():
 
     # ---- 写 json ----
     try:
-        write_json(net_r, net_m, pauses_r, pauses_m, items, rhythm_score,
-                   marked_r, marked_m, blocks_r, blocks_m, words_r, words_m)
+        write_json(net_r, net_m, pauses_r_all, pauses_m_all, items, rhythm_score,
+                   marked_r, marked_m, blocks_r, blocks_m, words_r, words_m,
+                   detail_r, detail_m)
         out("数据（机器）：节奏对比.json")
     except Exception as e:
         log("（写 json 失败：%s）" % e, show=True)
