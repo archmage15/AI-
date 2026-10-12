@@ -350,16 +350,28 @@ def mark_stress_neighborhood(feats, blocks, R=NEIGH_R, K=NEIGH_K, roles=None):
             if nbrs:
                 nbr_vals = [nm[j] for j in nbrs if j in nm]
                 nbr_med = float(np.median(nbr_vals)) if nbr_vals else my_val
-                is_local_max = all(my_val >= v for v in nbr_vals)
+                is_max = all(my_val >= v for v in nbr_vals)
+                is_min = all(my_val <= v for v in nbr_vals)
             else:
                 # 邻居不足 → 退回组面板
                 group_vals = list(nm.values())
                 nbr_med = float(np.mean(group_vals))
-                is_local_max = my_val >= nbr_med
-            gap = my_val - nbr_med
+                is_max = my_val >= nbr_med
+                is_min = my_val <= nbr_med
+            gap = my_val - nbr_med        # 正=高于邻居，负=低于
             block_norm[cue] = (my_val, gap / sigma if sigma > 0 else 0.0)
-            if is_local_max and gap >= K * sigma:
-                votes.append(cue)
+            mag = abs(gap)
+            if cue == "音高":
+                # 音高**双向**：升调（局部最大）或降调（局部最小）的显著偏离都算 prominence
+                # —— 英语重音可由音高下移实现（如 Terry 的降调重读，-9.41 半音）。
+                # ⚠️ 句末降调（intonation fall）也可能被误判为 prominence，
+                #    需人工听辨确认（块 11 尾巴，n=1 未标定）。
+                if (is_max or is_min) and mag >= K * sigma:
+                    votes.append(cue)
+            else:
+                # 响度/时长单向：只有"高/长"算突出（"轻/短"是弱化，不是 prominence）
+                if is_max and gap >= K * sigma:
+                    votes.append(cue)
 
         need = max(2, int(math.ceil(len(block_norm) / 2))) if block_norm else 99
         is_prom = len(votes) >= need
