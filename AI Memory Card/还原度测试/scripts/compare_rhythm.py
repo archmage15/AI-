@@ -68,9 +68,9 @@ BOUNDARY_GAP_S = 0.12    # 词间空隙 >= 这个 且 落在句子边界 -> 算�
 REL_FAST = 0.30          # 块时长相对差 >= +30% -> 要读快一些
 REL_SLOW = -0.30         # 块时长相对差 <= -30% -> 要读慢一些
 
-# ---- 重音参数 ----
-STRESS_X = 1.15          # 超过 本侧均值 × X 即判突出（各侧自比）
-DETREND = True           # 先去线性趋势（治"句首响句尾弱"的音量下倾），再判突出
+# ---- 重音参数（邻域法，计划书 §2.1；09-28 块 11 起替掉旧均值法）----
+NEIGH_R = 1             # 邻域半径：前后各 R 个同角色块当邻居
+NEIGH_K = 0.5           # 落差阈值：块值 - 邻居中位数 >= K·σ → 该路投突出
 
 
 # ---- 日志（统一模块，带时间戳；详细模式见 logkit.py 顶部说明）----
@@ -269,9 +269,9 @@ def resolve_duration(block, env):
     return span, "CTC帧", span, voiced
 
 
-# ================= 重音（信号，各侧自比） =================
+# ================= 重音（邻域法，计划书 §2.1；09-28 块 11 起替掉旧均值法） =================
 def block_signal_features(env, f0, blocks):
-    """每块算 响度峰值 / 音高均值（音高检测不到浊音时为 None）。"""
+    """每块算 响度峰值 / 音高均值 / 时长（音高检测不到浊音时为 None）。"""
     hop_s = HOP_MS / 1000.0
     feats = []
     for b in blocks:
@@ -285,85 +285,95 @@ def block_signal_features(env, f0, blocks):
         voiced = seg_f0[seg_f0 > 0] if len(seg_f0) else np.array([])
         pitch = float(voiced.mean()) if len(voiced) >= 2 else None
 
-        feats.append({"响度": loud, "音高": pitch})
+        feats.append({"响度": loud, "音高": pitch,
+                      "时长": (b["end_ms"] - b["start_ms"]) / 1000.0})
     return feats
 
 
-def detrend_linear(values):
-    """减去线性趋势线，消除"句首响句尾弱"的音量下倾，只留局部起伏。
-    全 None / 全 0 时原样返回。"""
-    arr = np.array([v if v is not None else np.nan for v in values], dtype=float)
-    valid = ~np.isnan(arr)
-    if valid.sum() < 3:
-        return list(values)
-    x = np.arange(len(arr))[valid]
-    y = arr[valid]
-    slope, intercept = np.polyfit(x, y, 1)
-    trend = slope * np.arange(len(arr)) + intercept
-    out = [None if np.isnan(v) else float(v - t)
-           for v, t in zip(arr, trend)]
-    return out
+def mark_stress_neighborhood(feats, blocks, R=NEIGH_R, K=NEIGH_K, roles=None):
+    """邻域法重音判定（§2.1）+ 角色分组叠加（§5.5）。
 
+    三路：音高(半音归一消性别) / 响度(÷中位) / 时长(÷中位)，各自**按角色组**归一。
+    每块对【同角色】前后邻块（半径 R）的中位数取差；局部最大且落差≥K·σ → 该路投突出。
+    同角色邻居不足时退回该组面板（用组均值当邻居中位数）。
+    某路在该块为 None → 弃权。need = max(2, ceil(可用路数/2)) 路投才算突出。
 
-def mark_stress(feats, x, detrend=True, roles=None):
-    """各侧自比：某块 响度/音高 超过【基准】× x 即算突出；任一过线即为突出块。
-    返回 (突出块序号列表, 逐块明细)。
-
-    09-28 块 10 改动（排期 §5.5）：**基准按【角色】分组算** ——
-    两人对话时全句统计量不成立（风险 22），A 的提问段和 B 的回答段
-    响度/音高本来就不在一个水平上，混在一起会把"A 段天然响"误判成"突出"。
-    组内样本太少（<2 个有效值）时退回全句基准（防 3 块的组算不出 std）。
-    roles 为 None 时保持旧行为（单组）。
+    ⚠️ 删了旧 `detrend_linear`：邻域法自带局部性，去趋势反而抹掉句尾弱化信号。
+    ⚠️ 时长与「节奏分」共用时长信号 → 风险 21「重复扣分」由大法师 09-23 拍板「照旧接受」。
     """
-    louds = [f["响度"] for f in feats]
-    pitches_raw = [f["音高"] for f in feats]
-
-    louds_use = detrend_linear(louds) if detrend else louds
-    pitches_use = detrend_linear(pitches_raw) if detrend else pitches_raw
-
-    def baseline(idxs):
-        """给一组下标算 (均值+偏移阈值) 基准；样本不足时返回 None。"""
-        vl = [louds_use[i] for i in idxs if louds_use[i] is not None]
-        vp = [pitches_use[i] for i in idxs if pitches_use[i] is not None]
-        if len(vl) < 2 and len(vp) < 2:
-            return None
-        ml = float(np.mean(vl)) if vl else 0.0
-        sl = float(np.std(vl)) if len(vl) > 1 else 0.0
-        mp = float(np.mean(vp)) if vp else 0.0
-        sp = float(np.std(vp)) if len(vp) > 1 else 0.0
-        return ml, sl, mp, sp
-
-    all_idx = list(range(len(feats)))
+    import math
+    n = len(feats)
+    if roles is None:
+        roles = [None] * n
     groups = {}
-    if roles:
-        for i, r in enumerate(roles):
-            groups.setdefault(r or "?", []).append(i)
-    else:
-        groups["*"] = all_idx
+    for i, r in enumerate(roles):
+        groups.setdefault(r, []).append(i)
 
-    base_all = baseline(all_idx)          # 兜底基准（全句）
-    base_of = {}                          # 组下标 -> 该组基准
+    def normed(idxs, cue):
+        """返回 {i: 归一值}, sigma。原始值 None/<=0 的弃掉。"""
+        raw = {i: feats[i].get(cue) for i in idxs}
+        raw = {i: v for i, v in raw.items()
+               if v is not None and v == v and v > 0}
+        if not raw:
+            return {}, 0.0
+        med = float(np.median(list(raw.values())))
+        if med <= 0:
+            return {}, 0.0
+        if cue == "音高":
+            out = {i: 12.0 * math.log2(v / med) for i, v in raw.items()}   # 半音，消性别
+        else:
+            out = {i: v / med for i, v in raw.items()}
+        sigma = float(np.std(list(out.values()))) if len(out) > 1 else 0.0
+        return out, sigma
+
+    # 三路归一值，按角色组
+    cue_of = {}     # role -> {cue: ({i:val}, sigma)}
     for r, idxs in groups.items():
-        base_of.update({i: (baseline(idxs) or base_all) for i in idxs})
+        cue_of[r] = {"音高": normed(idxs, "音高"),
+                     "响度": normed(idxs, "响度"),
+                     "时长": normed(idxs, "时长")}
 
     marked, detail = [], []
-    for i, f in enumerate(feats):
-        ml, sl, mp, sp = base_of.get(i) or base_all
-        flags = []
-        lv = louds_use[i]
-        pv = pitches_use[i]
-        if lv is not None and sl > 0 and lv > ml + (x - 1.0) * sl * 3:
-            flags.append("响")
-        if pv is not None and sp > 0 and pv > mp + (x - 1.0) * sp * 3:
-            flags.append("高")
-        if flags:
+    for i in range(n):
+        r = roles[i]
+        same = groups.get(r, [])
+        pos = same.index(i) if i in same else -1
+        # 同角色半径 R 内的邻居（不含自己）
+        nbrs = [same[j] for j in range(max(0, pos - R), min(len(same), pos + R + 1))
+                if pos >= 0 and same[j] != i] if pos >= 0 else []
+
+        votes, block_norm = [], {}
+        for cue, (nm, sigma) in cue_of.get(r, {}).items():
+            if i not in nm or sigma <= 0:
+                continue
+            my_val = nm[i]
+            if nbrs:
+                nbr_vals = [nm[j] for j in nbrs if j in nm]
+                nbr_med = float(np.median(nbr_vals)) if nbr_vals else my_val
+                is_local_max = all(my_val >= v for v in nbr_vals)
+            else:
+                # 邻居不足 → 退回组面板
+                group_vals = list(nm.values())
+                nbr_med = float(np.mean(group_vals))
+                is_local_max = my_val >= nbr_med
+            gap = my_val - nbr_med
+            block_norm[cue] = (my_val, gap / sigma if sigma > 0 else 0.0)
+            if is_local_max and gap >= K * sigma:
+                votes.append(cue)
+
+        need = max(2, int(math.ceil(len(block_norm) / 2))) if block_norm else 99
+        is_prom = len(votes) >= need
+        if is_prom:
             marked.append(i + 1)
-        detail.append({"序号": i + 1,
-                       "词": "+".join(f.get("词", [])) if "词" in f else "",
-                       "角色": (roles[i] if roles and i < len(roles) else None),
-                       "响度": None if lv is None else round(float(lv), 4),
-                       "音高": None if pv is None else round(float(pv), 2),
-                       "命中": flags})
+        detail.append({
+            "序号": i + 1,
+            "词": "+".join(feats[i].get("词", [])) if "词" in feats[i] else "",
+            "角色": r,
+            "归一值": {c: round(v[0], 3) for c, v in block_norm.items()},
+            "落差σ": {c: round(v[1], 2) for c, v in block_norm.items()},
+            "命中路": votes,
+            "突出": is_prom,
+        })
     return marked, detail
 
 
@@ -470,9 +480,26 @@ def plot_blocks(items, title="节奏对比（按词块序号）"):
     out("图已保存：" + OUT_PNG)
 
 
+def pitch_to_semitone(f0):
+    """F0(Hz) 序列 → 半音序列（相对该侧浊音中位 F0，消性别/个体基频）；unvoiced→None。
+    计划书阶段 5：语调只作可视化，不出分。"""
+    voiced = f0[f0 > 0]
+    if len(voiced) < 1:
+        return [None] * len(f0)
+    med = float(np.median(voiced))
+    if med <= 0:
+        return [None] * len(f0)
+    return [None if v <= 0 else round(12.0 * float(np.log2(v / med)), 2) for v in f0]
+
+
+def rms_series(env):
+    """RMS 能量序列（保留绝对量级，不归一化）—— 两侧电平本不同，仅作录音质量参考。"""
+    return [round(float(v), 5) for v in env]
+
+
 def write_json(net_r, net_m, pauses_r, pauses_m, items, rhythm_score,
                stress_r, stress_m, blocks_r, blocks_m, words_r, words_m,
-               detail_r, detail_m):
+               detail_r, detail_m, semi_r, semi_m, env_r, env_m):
     """写 节奏对比.json —— 给机器/综合评分器读。
     注：字段「节奏分」保持不变（overall_score.py 按这个名字读）；
        「语调分」本次不产出（语调整理中），overall_score.py 会自动跳过缺项。
@@ -511,10 +538,10 @@ def write_json(net_r, net_m, pauses_r, pauses_m, items, rhythm_score,
             "词块时长": items,
         },
         "重音_信号": {
-            "方法": "各侧自比·去趋势·组内均值+k×σ（09-28 起按【角色】分组算基准）",
+            "方法": "邻域法（三路投票：音高半音/响度÷中位/时长÷中位，按角色组归一；局部最大且落差≥K·σ）",
             "分组": "角色",
-            "阈值X": STRESS_X,
-            "去趋势": DETREND,
+            "半径R": NEIGH_R,
+            "阈值K": NEIGH_K,
             "原音频突出块": [{"序号": i, "块": nr.get(i, "?")} for i in stress_r],
             "我的突出块": [{"序号": i, "块": nm.get(i, "?")} for i in stress_m],
             "漏（原音频有）": [{"序号": i, "块": nr.get(i, "?")} for i in miss],
@@ -526,6 +553,21 @@ def write_json(net_r, net_m, pauses_r, pauses_m, items, rhythm_score,
         "词表": {"原音频": words_r, "我的": words_m},
         "节奏分": round(rhythm_score, 1),
         "语调分": None,          # 语调整理中，暂不出分
+        # ---- 阶段 5 可视化字段（不参与任何分，仅供 UI/报告参考）----
+        "音高曲线": {
+            "单位": "半音（相对本侧浊音中位 F0，0=中位）",
+            "原音频": semi_r,
+            "我的": semi_m,
+            "说明": "unvoiced 帧为 null；两侧基频不同，直接比绝对半音无意义，看走向",
+        },
+        "绝对响度": {
+            "单位": "RMS 振幅（0~1，未归一化）",
+            "原音频": rms_series(env_r),
+            "我的": rms_series(env_m),
+            "原音频均值": round(float(np.mean(env_r)), 5) if len(env_r) else None,
+            "我的均值": round(float(np.mean(env_m)), 5) if len(env_m) else None,
+            "说明": "两侧录音电平本不同（设备/距离），仅作录音质量参考，不参与任何分",
+        },
     }
     with open(OUT_JSON, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -596,8 +638,8 @@ def main():
     turns_r = [p for p in pauses_r_all if p["换人处"]]
     turns_m = [p for p in pauses_m_all if p["换人处"]]
 
-    # ---- 重音（按角色分组算基准，09-28 块 10）----
-    log_step("重音判定（各侧自比·按角色分组）")
+    # ---- 重音（邻域法 + 角色分组，09-28 块 11）----
+    log_step("重音判定（邻域法·按角色分组）")
     feats_r = block_signal_features(env_r, f0_r, blocks_r)
     feats_m = block_signal_features(env_m, f0_m, blocks_m)
     for i, b in enumerate(blocks_r):
@@ -606,8 +648,8 @@ def main():
         feats_m[i]["词"] = b["词"]
     roles_r = [b.get("角色") for b in blocks_r]
     roles_m = [b.get("角色") for b in blocks_m]
-    marked_r, detail_r = mark_stress(feats_r, STRESS_X, DETREND, roles_r)
-    marked_m, detail_m = mark_stress(feats_m, STRESS_X, DETREND, roles_m)
+    marked_r, detail_r = mark_stress_neighborhood(feats_r, blocks_r, NEIGH_R, NEIGH_K, roles_r)
+    marked_m, detail_m = mark_stress_neighborhood(feats_m, blocks_m, NEIGH_R, NEIGH_K, roles_m)
 
     # ---- 节奏分（score_blocks 内部已归一化 + 幂平均 p=3）----
     items, rhythm_score = score_blocks(pairs)
@@ -673,9 +715,11 @@ def main():
 
     # ---- 写 json ----
     try:
+        semi_r = pitch_to_semitone(f0_r)
+        semi_m = pitch_to_semitone(f0_m)
         write_json(net_r, net_m, pauses_r_all, pauses_m_all, items, rhythm_score,
                    marked_r, marked_m, blocks_r, blocks_m, words_r, words_m,
-                   detail_r, detail_m)
+                   detail_r, detail_m, semi_r, semi_m, env_r, env_m)
         out("数据（机器）：节奏对比.json")
     except Exception as e:
         log("（写 json 失败：%s）" % e, show=True)

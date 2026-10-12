@@ -45,10 +45,12 @@ OUT_REPORT = os.path.join(OUT_DIR, "还原度综合报告.txt")
 # 加/删维度：改这里 + collect_parts()，两处即可。
 DIMENSIONS = [
     ("发音", 0.40),
-    ("音变", 0.20),
-    ("语调", 0.20),
+    ("音变", 0.25),
     ("节奏", 0.20),
+    ("重音位置", 0.15),
 ]
+# 注：语调暂不出分（计划书 §4）—— 不进 DIMENSIONS、不参与加权；
+#    语调分仍从 rhythm["语调分"] 读，仅供报告显示。
 
 
 # ---- 日志（统一模块，带时间戳；详细模式见 logkit.py 顶部说明）----
@@ -111,6 +113,7 @@ ADVICE = {
     "音变": "音变（连读/弱化/吞音）偏弱：留意原音频里被“吃掉”或黏连的音，先慢读再连读。",
     "语调": "语调（音高起伏）偏弱：模仿原音频的升降调，疑问句尾音上扬、陈述句尾音下压。",
     "节奏": "节奏偏弱：跟着原音频打拍子，注意停顿位置和每句的重音落点。",
+    "重音位置": "重音落点偏弱：原音频强调的词你没强调，留意原音频哪几个词读得重、跟着加重。",
 }
 
 
@@ -136,7 +139,22 @@ def collect_parts(phoneme, rhythm):
         "音变": score_phoneme_change(stat),
         "语调": rhythm.get("语调分"),
         "节奏": rhythm.get("节奏分"),
+        "重音位置": score_stress_position(rhythm),
     }
+
+
+def score_stress_position(rhythm):
+    """重音位置分 = (1 − 漏数 / max(原音频突出块数,1)) × 100（计划书 §4 公式）。
+    漏 = 原音频突出、模仿没突出的块。⚠️ 只罚「漏」，不罚「多」——
+    多突出可能是感情色彩，漏原音频强调的词才是没还原。"""
+    if not rhythm:
+        return None
+    sig = rhythm.get("重音_信号") or {}
+    miss = sig.get("漏（原音频有）") or []
+    ref = sig.get("原音频突出块") or []
+    if not ref:
+        return None       # 原音频一个突出块都没判出来 → 没基准，不出分
+    return round(max(0.0, (1.0 - len(miss) / float(max(len(ref), 1))) * 100.0), 1)
 
 
 def build_advice(parts, phoneme, rhythm):
@@ -177,8 +195,9 @@ def main():
         return
     log("   音素对比.json：相似度 %s，差异 %d 条"
         % (phoneme.get("相似度"), len(phoneme.get("差异") or [])), verbose=True)
-    log("   节奏对比.json：节奏 %s ｜ 语调 %s"
-        % (rhythm.get("节奏分"), rhythm.get("语调分")), verbose=True)
+    log("   节奏对比.json：节奏 %s ｜ 语调 %s ｜ 重音位置 %s"
+        % (rhythm.get("节奏分"), rhythm.get("语调分"),
+           ((rhythm.get("重音_信号") or {}).get("原音频突出块") and "有" or "—")), verbose=True)
 
     log_step("计算分项分与综合分")
     stat = phoneme.get("对齐统计")
@@ -342,6 +361,8 @@ def write_report(overall, parts, phoneme, rhythm):
             miss = st.get("漏（原音频有）") or []
             if miss:
                 L.append("          漏掉的重音：" + "、".join(x.get("块", "") for x in miss))
+        # 语调：阶段 5 起降级为"仅可视化"，不出分
+        L.append("    语调：仅作可视化参考（音高曲线 / 绝对响度见 节奏对比.json），不出分")
     L.append("")
 
     # 五、改进建议
