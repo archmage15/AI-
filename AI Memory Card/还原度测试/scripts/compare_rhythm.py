@@ -432,7 +432,7 @@ def score_blocks(pairs):
     items = []
     norms = []
     total_r = sum(p["原音频时长"] for p in pairs if p["原音频时长"] > 0)
-    total_m = sum(p["我的时长"] for p in pairs if p["原音频时长"] > 0)
+    total_m = sum(p["我的时长"] for p in pairs if p["我的时长"] > 0)
     for p in pairs:
         dr, dm = p["原音频时长"], p["我的时长"]
         if dr <= 0:

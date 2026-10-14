@@ -23,20 +23,14 @@ r"""还原度对比 · 第二块：音素
   把原音频转成"词 + 时间"，从而在每条纠错后面标出对应的单词。
   没有该文件 / 断网 / 无额度时自动跳过，只给音素级结果。
 
-依赖：torch / transformers / soundfile / numpy / requests
+依赖：torch / transformers / soundfile / numpy
       （解码直接用模型自带 vocab.json，不需要额外装 phonemizer）
 """
-import base64
 import difflib
-import hashlib
-import hmac
 import json
 import os
 import sys
-import tempfile
-import time
 import unicodedata
-from urllib.parse import urlencode
 
 import numpy as np
 
@@ -73,10 +67,6 @@ MODEL_ID = "facebook/wav2vec2-lv-60-espeak-cv-ft"
 LOCAL_DIR = os.environ.get("PHONEME_MODEL_DIR") or os.path.join(ROOT, "models", "wav2vec2-espeak")
 SR = 16000
 
-# 讯飞转写（LFASR）配置：放在 ROOT 下，用于给音素打"单词"标签。
-# 没有这个文件 / 断网 / 无额度时，脚本自动降级成"只给音素级结果"。
-XF_CONFIG = os.path.join(ROOT, "讯飞配置.json")
-XF_HOST = "https://raasr.xfyun.cn/v2/api"
 # wav2vec2 特征提取下采样步长 320 采样点 @16kHz -> 每帧 20ms
 FRAME_MS = 20
 
@@ -241,196 +231,7 @@ def ensure_model():
     return LOCAL_DIR
 
 
-# ---------------- 讯飞转写（拿"词 + 时间"，给音素打单词标签）----------------
-
-def xf_make_signa(appid, secret_key, ts):
-    """讯飞 LFASR v2 签名：base64(HMAC-SHA1(secret_key, md5(appid+ts)))"""
-    md5_hex = hashlib.md5((appid + ts).encode("utf-8")).hexdigest()
-    raw = hmac.new(secret_key.encode("utf-8"), md5_hex.encode("utf-8"), hashlib.sha1).digest()
-    return base64.b64encode(raw).decode("utf-8")
-
-
-def xf_prepare_audio(src_path):
-    """转成 16kHz 单声道 wav（讯飞常规要求），返回 (临时文件路径, 时长秒)。"""
-    import soundfile as sf
-    audio, sr = sf.read(src_path, dtype="float32", always_2d=True)
-    audio = audio.mean(axis=1)
-    if sr != SR:
-        n_out = int(round(len(audio) * SR / sr))
-        x_in = np.linspace(0, 1, len(audio), endpoint=False)
-        x_out = np.linspace(0, 1, n_out, endpoint=False)
-        audio = np.interp(x_out, x_in, audio).astype(np.float32)
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", dir=OUT_DIR, delete=False)
-    tmp.close()
-    sf.write(tmp.name, audio, SR, subtype="PCM_16")
-    return tmp.name, len(audio) / float(SR)
-
-
-def xf_collect_words(node, bg, out):
-    """递归收集带 cw/wb/we 的词节点；绝对时间 = bg + 帧*10ms。"""
-    if isinstance(node, dict):
-        if "cw" in node and ("wb" in node or "we" in node):
-            wb = int(node.get("wb") or 0)
-            we = int(node.get("we") or 0)
-            for c in node.get("cw") or []:
-                w = (c.get("w") or "").strip()
-                if w and c.get("wp") != "p":
-                    out.append({"word": w, "start_ms": bg + wb * 10, "end_ms": bg + we * 10})
-        for v in node.values():
-            xf_collect_words(v, bg, out)
-    elif isinstance(node, list):
-        for v in node:
-            xf_collect_words(v, bg, out)
-
-
-def xf_parse_order_result(text):
-    data = json.loads(text)
-    words = []
-    for seg in data.get("lattice", []):
-        one = json.loads(seg["json_1best"])
-        st = one.get("st", {})
-        bg = int(st.get("bg") or one.get("bg") or 0)
-        xf_collect_words(st, bg, words)
-    return words
-
-
-def transcribe_words(audio_path):
-    """对音频跑讯飞转写，返回 [{"word","start_ms","end_ms"}]；失败抛异常。"""
-    import requests
-    if not os.path.exists(XF_CONFIG):
-        raise RuntimeError("缺少配置文件 " + XF_CONFIG)
-    with open(XF_CONFIG, encoding="utf-8") as f:
-        cfg = json.load(f)
-    appid = (cfg.get("appid") or "").strip()
-    secret_key = (cfg.get("secret_key") or "").strip()
-    if not appid or not secret_key:
-        raise RuntimeError("讯飞配置.json 缺 appid / secret_key")
-
-    tmp_audio, duration_s = xf_prepare_audio(audio_path)
-    try:
-        ts = str(int(time.time()))
-        signa = xf_make_signa(appid, secret_key, ts)
-        params = {
-            "appId": appid, "signa": signa, "ts": ts,
-            "fileSize": os.path.getsize(tmp_audio),
-            "fileName": os.path.basename(tmp_audio),
-            "duration": str(int(round(duration_s))),
-        }
-        with open(tmp_audio, "rb") as f:
-            data = f.read()
-        resp = requests.post(XF_HOST + "/upload?" + urlencode(params),
-                             headers={"Content-type": "application/json"},
-                             data=data, timeout=60).json()
-        if resp.get("code") != "000000":
-            raise RuntimeError("上传失败：" + json.dumps(resp, ensure_ascii=False))
-        order_id = resp["content"]["orderId"]
-        for _ in range(60):
-            time.sleep(3)
-            r = requests.post(XF_HOST + "/getResult?" + urlencode({
-                "appId": appid, "signa": signa, "ts": ts,
-                "orderId": order_id, "resultType": "transfer"}), timeout=60).json()
-            if r.get("code") != "000000":
-                raise RuntimeError("查询失败：" + json.dumps(r, ensure_ascii=False))
-            info = r["content"].get("orderInfo", {})
-            status = info.get("status")
-            if status == 4:
-                return xf_parse_order_result(r["content"].get("orderResult"))
-            if status == -1:
-                raise RuntimeError("订单失败：" + json.dumps(info, ensure_ascii=False))
-        raise RuntimeError("转写超时")
-    finally:
-        try:
-            os.remove(tmp_audio)
-        except Exception:
-            pass
-
-
-def assign_word_indices(times_ms, words):
-    """给每个音素时间点找所属单词下标（落在词区间内；否则取最近词的边界）。"""
-    if not words:
-        return [None] * len(times_ms)
-    out = []
-    for t in times_ms:
-        hit = None
-        for wi, w in enumerate(words):
-            if w["start_ms"] <= t <= w["end_ms"]:
-                hit = wi
-                break
-        if hit is None:
-            hit = min(range(len(words)),
-                      key=lambda wi: min(abs(t - words[wi]["start_ms"]),
-                                         abs(t - words[wi]["end_ms"])))
-        out.append(hit)
-    return out
-
-
-def word_indices(idxs, words):
-    return sorted({i for i in idxs if i is not None})
-
-
-# ---------------- 连读区识别（用讯飞词边界校正音素归词）----------------
-#
-# 为什么要有这一段：
-#   本地模型是 CTC 盲拆，没有"词"的概念。原来把每个音素按时间点塞进讯飞的词区间里，
-#   塞不进去的就甩给"最近的词"。在连读处（如 Where are），讯飞自己都把整团划给了
-#   Where，are 只剩 30ms 碎屑 —— 结果音素被整团错归给 Where，报告只能含糊写
-#   "Where → are 之间"。
-#
-#   这里的做法：先看讯飞给的词区间靠不靠谱。够宽的正常归词；太窄的判定为"碎片词"，
-#   与相邻词合成"连读区"，明确告诉学生"这里是一个连读，按整体看"——因为连读本来
-#   就切不开，硬切反而错。
-
-def build_word_spans(words, frame_times, total_ms):
-    """把讯飞的词表变成一段段稳定的区间，并统计每段里落了几个音素。
-
-    做三件修补，防止词表边界与音素时间对不上：
-      1) 首尾补边：第 0 个词之前、最后一个词之后若还有音素，也要有区间可归。
-      2) 单调修正：强制 start 严格递增，避免区间互相挤夹。
-      3) 容差命中：FRAME_MS 之内都算落在该词里（帧边界会抖）。
-    """
-    if not words:
-        return []
-
-    spans = []
-    for i, w in enumerate(words):
-        s = int(w.get("start_ms") or 0)
-        e = int(w.get("end_ms") or 0)
-        if e < s:
-            e = s
-        spans.append({"idx": i, "word": w["word"], "start_ms": s, "end_ms": e, "n_ph": 0})
-
-    # 1) 首尾补边：让整条时间轴都被覆盖，音素不会有"无主"的空白
-    if spans:
-        spans[0]["start_ms"] = 0
-        spans[-1]["end_ms"] = max(int(total_ms), spans[-1]["end_ms"])
-
-    # 2) 单调修正：start 必须严格递增
-    for i in range(1, len(spans)):
-        if spans[i]["start_ms"] <= spans[i - 1]["start_ms"]:
-            spans[i]["start_ms"] = spans[i - 1]["start_ms"] + 1
-        if spans[i]["start_ms"] >= spans[i]["end_ms"]:
-            spans[i]["end_ms"] = spans[i]["start_ms"] + 1
-
-    # 3) 容差命中的方式统计每个区间的音素数（用区间中点判，避免边界抖动）
-    for t in frame_times:
-        t = int(t)
-        for sp in spans:
-            lo = sp["start_ms"] - FRAME_MS
-            hi = sp["end_ms"] + FRAME_MS
-            if lo <= t <= hi:
-                sp["n_ph"] += 1
-                break
-
-    for sp in spans:
-        span_ms = sp["end_ms"] - sp["start_ms"]
-        sp["span_ms"] = span_ms
-        # 碎片词 = 时长过短（只按时长判，不看音素数）。
-        # 有些长词可能一个音都没分到（如感叹词 oh 在原音频里没被单独拆出音素），
-        # 那是识别粒度问题，不是连读，不该并进连读区。
-        sp["short"] = span_ms < MIN_WORD_MS
-
-    return spans
-
+# ---------------- 连读区识别（用参考音素表词边界 + 序号对齐）----------------
 
 def build_text_spans(word_bounds, owner, frame_times):
     """用「参考文本给的词边界 + CTC 帧给的时间」拼出 spans。
@@ -559,51 +360,6 @@ def pair_fragments(spans):
 
     main = [sp for i, sp in enumerate(spans) if i not in consumed]
     return main, zones, zone_of
-
-
-def assign_word_owner(times_ms, spans, zones, main_map):
-    """音素时间点 -> 归属编码。
-
-    返回值 list，每项：
-      "zone:K"  → 落在第 K 个连读区（切不开，按整体看）
-      "word:W"  → 落在某个正常词（W 是词名）
-      None      → 没归属（降级用）
-
-    判定顺序很重要：**先正常词、后连读区**。
-    如果倒过来（连读区优先），连读区边界上的音素会把相邻正常词的音也吸进来
-    —— 实测发生过：so 的音 oʊ 被算进了 Where are 连读区。
-    """
-    out = []
-    for t in times_ms:
-        t = int(t)
-        hit = None
-        # 1) 先看是不是落在某个正常词的精确区间里（含一个帧的容差）
-        for sp in spans:
-            if (sp["start_ms"] - FRAME_MS) <= t <= (sp["end_ms"] + FRAME_MS):
-                hit = "word:%s" % sp["word"]
-                break
-        # 2) 正常词都没命中，才考虑连读区（不加容差，避免边界溢出）
-        if hit is None:
-            for z in zones:
-                if z["start_ms"] <= t <= z["end_ms"]:
-                    hit = "zone:%d" % z["zone_idx"]
-                    break
-        if hit is None:
-            for sp in spans:
-                if (sp["start_ms"] - FRAME_MS) <= t <= (sp["end_ms"] + FRAME_MS):
-                    hit = "word:%s" % sp["word"]
-                    break
-        if hit is None:
-            # 兜底：取最近的主区间（与旧逻辑同义，保证任何音素都有归属）
-            best, best_d = None, None
-            for sp in spans:
-                d = min(abs(t - sp["start_ms"]), abs(t - sp["end_ms"]))
-                if best_d is None or d < best_d:
-                    best, best_d = sp, d
-            if best is not None:
-                hit = "word:%s" % best["word"]
-        out.append(hit)
-    return out
 
 
 def map_words_to_audio(text_ph, audio_ph, word_bounds):
@@ -735,7 +491,7 @@ def format_words(word_ids, words, zone_names=None):
         for nm in zone_names:
             all_words.extend(nm.split(" "))
         names = '" "'.join(all_words)
-        return "【连读区 \"%s\"】⚠ 这里是连读，按整体的读法看，不必拆开" % names
+        return "【连读区 \"%s\"】⚠ 这两个词黏在一起读，按整体练，不必逐个拆" % names
     if not words or not word_ids:
         return ""
     if len(word_ids) == 1:
@@ -820,8 +576,8 @@ def write_report(ref, mine, sm, words, ratio, diff_items, problem_words):
         L.append("")
         L.append("    ※ [缺音]/[多音] 多出现在连读、弱化、吞音处——这就是“音变”")
         if any(it.get("zone") for it in diff_items):
-            L.append("    ※ 标了「连读区」的地方，是两个词黏在一起读（如 Where are），")
-            L.append("      连读本来就是一整团、切不开，按整体的读法练就好，不必拆单个音。")
+            L.append("    ※ 标了「连读区」的地方，是两个词黏在一起读（如 Where are）——")
+            L.append("      可能是连读，也可能是词太短、系统测不准，总之按整体练，不必逐个拆。")
     else:
         L.append("    （音素序列完全一致，很棒）")
     # 原句（问题词用【】框出）
@@ -1035,7 +791,7 @@ def main():
             "连读区": [{"词": z["words"], "start_ms": z["start_ms"], "end_ms": z["end_ms"],
                         "n_ph": z["n_ph"],
                         "归词音素数": [[spans[m]["word"], spans[m]["n_ph"]] for m in z["member_idx"]],
-                        "说明": "%s 处连读，按整体看" % " ".join(z["words"])}
+                        "说明": "%s 黏连成块（连读或短词测量不足），按整体看" % " ".join(z["words"])}
                        for z in zones],
             "命中差异的连读区": list(zone_hits.values()),
             "词音素分布": [{"word": sp["word"], "n_ph": sp["n_ph"],
@@ -1068,8 +824,10 @@ def main():
                        "词块": word_blocks,
                        "单词错误": word_errors or None,
                        "参考音素可用": bool(ref_data)}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        # 写盘失败必须让人看见：下游 compare_rhythm / overall_score 都读这个 json，
+        # 它没写出来 = 整条链断。旧版 except:pass 会静默吞掉，这里改成显式告警。
+        log("（写 音素对比.json 失败，下游将读不到数据：%s）" % e, show=True)
 
     log_done("音素对比")
 

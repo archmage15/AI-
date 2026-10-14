@@ -4,8 +4,7 @@ cd /d %~dp0
 setlocal enabledelayedexpansion
 
 rem ============================================================
-rem  AI Recorder Card - Speech Evaluation Test Kit
-rem  One-click dependency installer
+rem  还原度测试 - 一键装依赖
 rem
 rem  What it does:
 rem    1. locate a Python (3.11+)
@@ -13,7 +12,7 @@ rem    2. create an isolated .venv in this folder
 rem    3. install dependencies (torch from official PyPI)
 rem    4. self-check: can we import the key libraries
 rem
-rem  After this, every .bat in the kit auto-uses this .venv.
+rem  After this, 一键跑还原度.bat auto-uses this .venv.
 rem ============================================================
 
 echo ============================================================
@@ -82,8 +81,8 @@ echo.
 rem ---------- 3. install ----------
 rem All packages come from official PyPI. The Tsinghua mirror lags
 rem badly behind for this project: it lacks the pinned versions (e.g.
-rem torch 2.14.0, azure-speech 1.51.2, numpy 2.5.3 ...), so pip
-rem reports "from versions: none". Official PyPI has them all.
+rem torch 2.14.0, numpy 2.5.3 ...), so pip reports "from versions: none".
+rem Official PyPI has them all.
 set "MIRROR=https://pypi.org/simple"
 
 echo [3/4] upgrading pip ...
@@ -114,7 +113,7 @@ echo.
 
 rem ---------- 4. self check ----------
 echo [4/4] self-check: importing key libraries ...
-"%VPY%" -c "import azure.cognitiveservices.speech, websocket, numpy, sounddevice, soundfile, torch, transformers, matplotlib; print('      all OK'); print('      torch', torch.__version__)"
+"%VPY%" -c "import numpy, soundfile, torch, transformers, huggingface_hub, matplotlib; print('      all OK'); print('      torch', torch.__version__)"
 if errorlevel 1 (
     echo.
     echo [ERROR] self-check failed. The error above usually names the missing lib.
@@ -127,9 +126,9 @@ echo ============================================================
 echo    DONE
 echo ============================================================
 echo.
-echo    You can now double-click the .bat files in each subfolder.
+echo    You can now double-click 一键跑还原度.bat.
 echo.
-echo    The FIRST run of "run_phoneme.bat" downloads the phoneme
-echo    model ^(about 1.2GB^). Slow once, fast afterwards.
+echo    The FIRST run downloads the phoneme model ^(about 1.2GB^).
+echo    Slow once, fast afterwards.
 echo.
 pause

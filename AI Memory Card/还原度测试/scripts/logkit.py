@@ -69,8 +69,8 @@ _READY = False         # log_setup 跑过之后才 true：在此之前只打印�
 
 def _now():
     """当前时刻，精确到毫秒。"""
-    return datetime.datetime.now().strftime("%H:%M:%S.") + \
-        "%03d" % (datetime.datetime.now().microsecond // 1000)
+    now = datetime.datetime.now()   # 只取一次，避免时分秒与毫秒来自两个跨秒的 now
+    return now.strftime("%H:%M:%S.") + "%03d" % (now.microsecond // 1000)
 
 
 def _ensure_dir():
