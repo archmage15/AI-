@@ -18,6 +18,7 @@
 依赖：只用标准库（读 json、写 txt），不需要 torch —— 秒出结果。
 用法：先跑 音素对比 / 节奏对比（或直接双击 一键跑还原度.bat），再跑本脚本。
 """
+import datetime
 import json
 import os
 import sys
@@ -38,6 +39,7 @@ PHONEME_JSON = os.path.join(OUT_DIR, "音素对比.json")
 RHYTHM_JSON = os.path.join(OUT_DIR, "节奏对比.json")
 OUT_JSON = os.path.join(OUT_DIR, "还原度综合评分.json")
 OUT_REPORT = os.path.join(OUT_DIR, "还原度综合报告.txt")
+HISTORY_JSON = os.path.join(OUT_DIR, "history.json")
 
 # ---- 维度定义：全局唯一来源 ----
 # 顺序 = 展示顺序；权重必须和为 1。
@@ -66,6 +68,35 @@ def read_json(path):
             return json.load(f)
     except Exception:
         return None
+
+
+def read_history():
+    """读 history.json（历史分数列表）；不存在/损坏返回空列表。"""
+    if not os.path.exists(HISTORY_JSON):
+        return []
+    try:
+        with open(HISTORY_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def append_history(overall, parts):
+    """把本次综合分追加进 history.json，供报告显示「上次 vs 这次」的进步。"""
+    entry = {
+        "时间": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "综合分": round(overall, 1),
+        "分项": {k: (round(parts[k], 1) if parts.get(k) is not None else None)
+                  for k, _w in DIMENSIONS},
+    }
+    hist = read_history()
+    hist.append(entry)
+    try:
+        with open(HISTORY_JSON, "w", encoding="utf-8") as f:
+            json.dump(hist, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log("（写 history.json 失败，不影响评分：%s）" % e, show=True)
 
 
 def score_pronunciation(stat):
@@ -121,12 +152,12 @@ ADVICE = {
 # 旧字段 总时长秒 / 对齐 / 停顿 / 子项分 已失效（现网 JSON 里不存在）。
 # 若继续用 .get(..., 0) 兜底，会静默变成 0 —— 所以这里取不到就告警。
 def rhythm_section(rhythm, key):
-    """取 节奏_讯飞.<key>；取不到则记日志告警并返回 None。"""
+    """取 节奏.<key>；取不到则记日志告警并返回 None。"""
     if not rhythm:
         return None
-    sec = (rhythm.get("节奏_讯飞") or {}).get(key)
+    sec = (rhythm.get("节奏") or {}).get(key)
     if sec is None:
-        log("⚠ 节奏对比.json 里没有 节奏_讯飞.%s（字段失效或脚本未更新），该项显示为「—」" % key,
+        log("⚠ 节奏对比.json 里没有 节奏.%s（字段失效或脚本未更新），该项显示为「—」" % key,
             show=True)
     return sec
 
@@ -167,7 +198,7 @@ def build_advice(parts, phoneme, rhythm):
         v = parts.get(k)
         if v is not None and v < 75 and k in ADVICE:
             tips.append(ADVICE[k])
-    # 从停顿明细再补一条针对性提示（真实键：节奏_讯飞.句子边界停顿）
+    # 从停顿明细再补一条针对性提示（真实键：节奏.句子边界停顿）
     ps = rhythm_section(rhythm, "句子边界停顿")
     if ps and ps.get("原音频处数") != ps.get("我的处数"):
         tips.append("停顿数量与原音频不一致（原音频 %s 处 / 你 %s 处），注意不要多停或少停。"
@@ -262,6 +293,9 @@ def main():
     except Exception as e:
         log("（写 json 失败：%s）" % e, show=True)
 
+    # ---- 记历史（供报告显示进步）----
+    append_history(overall, parts)
+
     # ---- 写报告（给人）----
     try:
         write_report(overall, parts, phoneme, rhythm)
@@ -283,6 +317,18 @@ def write_report(overall, parts, phoneme, rhythm):
     L.append("原音频.wav  vs  模仿.wav（跟读还原度）")
     L.append("")
     L.append("综合还原度：%.1f / 100     等级：%s" % (overall, grade(overall)))
+    hist = read_history()
+    if len(hist) >= 2:
+        prev = hist[-2]
+        prev_score = prev.get("综合分")
+        if prev_score is not None:
+            diff = round(overall, 1) - prev_score
+            if abs(diff) < 0.05:
+                delta = "持平"
+            else:
+                delta = ("↑ %+.1f" if diff > 0 else "↓ %+.1f") % diff
+            L.append("   上次 %.1f 分（%s）→ 这次 %.1f 分，%s"
+                     % (prev_score, prev.get("时间", "?"), overall, delta))
     L.append("")
     L.append("-" * 60)
     L.append("一、分项得分（发音最重，其余持平）")
@@ -342,7 +388,7 @@ def write_report(overall, parts, phoneme, rhythm):
                      % (net.get("原音频", 0), net.get("我的", 0), (net.get("相对差") or 0) * 100))
         else:
             L.append("    净时长：（数据缺失）")
-        if (rhythm.get("节奏_讯飞") or {}).get("序号对齐风险"):
+        if (rhythm.get("节奏") or {}).get("序号对齐风险"):
             L.append("    ⚠ 两侧词块序号可能未对齐，以下节奏明细仅供参考")
         if ps:
             L.append("    停顿：原音频 %s 处  |  你 %s 处"

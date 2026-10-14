@@ -59,6 +59,13 @@ VERBOSE = os.environ.get("LOG_VERBOSE", "").strip() in ("1", "true", "True", "ye
 OFF = os.environ.get("LOG_OFF", "").strip() in ("1", "true", "True", "yes")
 QUIET = os.environ.get("LOG_QUIET", "").strip() in ("1", "true", "True", "yes")
 
+# ---- 同一轮判断阈值（秒）----
+# 三个脚本由一键 bat 顺序跑，同一轮间隔 < 几秒。但 compare_phoneme 首次下载
+# 模型（1.2GB）时，下载期间日志不写盘、mtime 停在下载前；慢网下下载会超过
+# 60 秒，导致 compare_rhythm 误判成"新一轮"、把音素那步的日志冲掉。
+# 放宽到 10 分钟，覆盖最长的单步耗时。
+SESSION_GAP_S = 600
+
 # ---- 内部状态 ----
 _START = None          # 本次 main() 的起始时刻（算总耗时用）
 _TAG = ""              # 当前脚本名（写进单次日志的分隔线里）
@@ -114,8 +121,8 @@ def log_setup(tag):
     无法互相知道 —— 所以改用"一键 bat 传环境变量"的方式太重。
 
     最终方案：**按时间判断**。若"本次运行.txt"的最后修改时间距现在
-    超过 60 秒，就认为这是一轮新的运行，清空重写；否则视为同一轮的
-    后续脚本，追加。这样既不用改 bat，也能让三步串在同一个文件里。
+    超过 SESSION_GAP_S 秒，就认为这是一轮新的运行，清空重写；否则视为
+    同一轮的后续脚本，追加。这样既不用改 bat，也能让三步串在同一个文件里。
     """
     global _START, _TAG
     _START = time.time()
@@ -125,8 +132,8 @@ def log_setup(tag):
     if os.path.exists(LOG_THIS):
         try:
             age = time.time() - os.path.getmtime(LOG_THIS)
-            if age < 60:
-                fresh = False          # 1 分钟内有别的脚本写过 → 同一轮
+            if age < SESSION_GAP_S:
+                fresh = False          # 阈值内有脚本写过 → 同一轮，追加
         except Exception:
             fresh = True
 

@@ -53,6 +53,7 @@ for _d in (SRC_DIR, OUT_DIR):
 REF_FILE = os.path.join(SRC_DIR, "原音频.wav")
 MY_FILE = os.path.join(SRC_DIR, "模仿.wav")
 OUT_PNG = os.path.join(OUT_DIR, "节奏对比.png")
+OUT_PNG_PITCH = os.path.join(OUT_DIR, "音高对比.png")
 OUT_JSON = os.path.join(OUT_DIR, "节奏对比.json")   # 给机器/综合评分器用
 # 本脚本的唯一词块时间来源：compare_phoneme.py 的产出（09-28 块 10 起，去讯飞）
 PHONEME_JSON = os.path.join(OUT_DIR, "音素对比.json")
@@ -60,8 +61,7 @@ PHONEME_JSON = os.path.join(OUT_DIR, "音素对比.json")
 SR = 16000
 FRAME_MS = 25
 HOP_MS = 10
-VOICED_RATIO = 0.12      # 能量低于 全句 max*该比例 算静音（判"实证有声时长"用）
-FIX_TOLERANCE_S = 0.15   # 讯飞时长与实证有声差超过这个 -> 以实证为准
+VOICED_RATIO = 0.12      # 能量低于 全句 max*该比例 算静音（判"实测有声时长"用，供报告参考）
 
 # ---- 节奏参数 ----
 BOUNDARY_GAP_S = 0.12    # 词间空隙 >= 这个 且 落在句子边界 -> 算停顿
@@ -259,13 +259,15 @@ def measure_voiced(env, block):
 
 
 def resolve_duration(block, env):
-    """块时长 vs 能量实证：差得离谱时以实证为准（块时长来自 CTC 帧，09-28 起标签改名）。
-    注：FIX_TOLERANCE_S=0.15 是讯飞时代定的（讯飞边界虚高才会差那么多）；
-       CTC span 是音素起点拼的、偏紧，这道复核现在很少触发，留着当护栏。"""
+    """块时长：直接取 CTC span（音素起点拼的，偏紧但可信）。
+
+    09-28 去讯飞后词块时间来自 CTC 帧。旧版这里有一道"能量实证复核"——
+    讯飞时代讯飞词边界会"虚高"（把静音算进词时长），需用实测有声时长修正。
+    但 CTC span 本身偏紧、不含 stop-closure 静音，可信；若再拿"实测有声"去
+    替代，反而会把爆破音成阻段（t/p/k 的闭嘴段）当静音剥掉、低估词时长。
+    所以这道复核已废弃，直接信 span（voiced 仍算出来供报告/调试参考）。"""
     span = block_span(block)
     voiced = measure_voiced(env, block)
-    if voiced > 0 and abs(span - voiced) > FIX_TOLERANCE_S:
-        return voiced, "实证", span, voiced
     return span, "CTC帧", span, voiced
 
 
@@ -492,6 +494,36 @@ def plot_blocks(items, title="节奏对比（按词块序号）"):
     out("图已保存：" + OUT_PNG)
 
 
+def plot_pitch(semi_r, semi_m):
+    """画音高走向对比图（原音频 vs 我的，半音曲线叠加，看语调升降）。
+    半音相对本侧浊音中位 F0；unvoiced 帧为 None（跳过不画，曲线自然断开）。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    hop_s = HOP_MS / 1000.0
+    t_r = [i * hop_s for i, v in enumerate(semi_r) if v is not None]
+    v_r = [v for v in semi_r if v is not None]
+    t_m = [i * hop_s for i, v in enumerate(semi_m) if v is not None]
+    v_m = [v for v in semi_m if v is not None]
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    if t_r:
+        ax.plot(t_r, v_r, label="原音频", color="#c0392b", linewidth=1.2)
+    if t_m:
+        ax.plot(t_m, v_m, label="我的模仿", color="#2471a3", linewidth=1.2)
+    ax.set_xlabel("时间 (秒)")
+    ax.set_ylabel("音高（半音，相对本侧中位）")
+    ax.set_title("音高走向对比（语调可视化参考，不出分）")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(OUT_PNG_PITCH, dpi=120)
+    out("图已保存：" + OUT_PNG_PITCH)
+
+
 def pitch_to_semitone(f0):
     """F0(Hz) 序列 → 半音序列（相对该侧浊音中位 F0，消性别/个体基频）；unvoiced→None。
     计划书阶段 5：语调只作可视化，不出分。"""
@@ -515,9 +547,7 @@ def write_json(net_r, net_m, pauses_r, pauses_m, items, rhythm_score,
     """写 节奏对比.json —— 给机器/综合评分器读。
     注：字段「节奏分」保持不变（overall_score.py 按这个名字读）；
        「语调分」本次不产出（语调整理中），overall_score.py 会自动跳过缺项。
-    ⚠️ 顶层键「节奏_讯飞」**名字保留**（09-28 去讯飞后已是历史名，但
-       overall_score.py 读它 —— 键名是下游依赖，不能随手改），
-       内部加「数据源」字段说明真实来源。
+    （09-28 去讯飞后，顶层键改为「节奏」，不再带「讯飞」字样；内部「数据源」字段说明真实来源。）
     """
     nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r)}
     nm = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_m)}
@@ -535,8 +565,8 @@ def write_json(net_r, net_m, pauses_r, pauses_m, items, rhythm_score,
     normal_m, turns_m = pause_part(pauses_m)
 
     data = {
-        "节奏_讯飞": {
-            "数据源": "音素对比.json.词块（CTC 帧，09-28 块 10 起去讯飞；键名为兼容保留）",
+        "节奏": {
+            "数据源": "音素对比.json.词块（CTC 帧，09-28 块 10 起去讯飞）",
             "整句净时长": {"原音频": round(net_r, 3), "我的": round(net_m, 3),
                            "相对差": round((net_m - net_r) / net_r, 4) if net_r > 0 else 0},
             "词块数": {"原音频": len(blocks_r), "我的": len(blocks_m)},
@@ -724,6 +754,12 @@ def main():
         plot_blocks(items)
     except Exception as e:
         log("（画图失败，不影响上面数据：%s）" % e, show=True)
+    try:
+        semi_r = pitch_to_semitone(f0_r)
+        semi_m = pitch_to_semitone(f0_m)
+        plot_pitch(semi_r, semi_m)
+    except Exception as e:
+        log("（画音高图失败，不影响上面数据：%s）" % e, show=True)
 
     # ---- 写 json ----
     try:
