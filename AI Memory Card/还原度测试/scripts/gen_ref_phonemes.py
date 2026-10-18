@@ -187,10 +187,25 @@ def main():
 
     phonemes, word_bounds = [], []
     all_unknown, problems = [], []
+    sentences = []          # 句子边界：[{"句号":1, "文本":"...", "a":0, "b":32, "角色":"A"}]
+                          # a/b 是音素下标（闭开区间）。用于长音频按句评测：
+                          # 参考序列按句切段，模仿音素按内容对齐进各句区间。
 
     for si, seg in enumerate(segments):
         role = role_names[si] if si < len(role_names) else "?"
         words = [w for w in (clean_word(x) for x in seg.split()) if w]
+        # 按句末标点（. ? ! ；;）把词切成句子 —— 只切文本，不用任何时间戳。
+        # ⚠️ 必须在**原始词**（未剥标点）上判断句末：clean_word 已把标点去掉，
+        #    拿剥完的词判断会一句都切不出来（实测踩过）。
+        raw_words = [x for x in seg.split() if clean_word(x)]
+        sent_groups, cur = [], []
+        for rw in raw_words:
+            cur.append(clean_word(rw))
+            if rw and rw[-1] in ".?!;":
+                sent_groups.append(cur)
+                cur = []
+        if cur:
+            sent_groups.append(cur)
         rc, out, err = raw_phonemize(exe, seg)
         if rc != 0:
             print("X espeak-ng 失败：%s" % err.strip())
@@ -201,7 +216,16 @@ def main():
             # ⚠️ 段数对不上：espeak 可能把两个词连读了（如 want to -> wɒntə）
             problems.append("角色 %s：输入 %d 词，espeak 输出 %d 段 —— 对应关系不明"
                             % (role, len(words), len(parts)))
-        print("角色 %s：%d 词" % (role, len(words)))
+        print("角色 %s：%d 词，%d 句" % (role, len(words), len(sent_groups)))
+
+        # 词 -> 句号 映射（按词序累加，与 espeak 段错位时也保持句子结构）
+        word2sent = {}
+        wi_sent = 0
+        for gi, g in enumerate(sent_groups):
+            for _ in g:
+                if wi_sent < len(words):
+                    word2sent[wi_sent] = gi
+                    wi_sent += 1
 
         for wi, w in enumerate(words):
             if wi < len(parts):
@@ -212,10 +236,25 @@ def main():
             a = len(phonemes)
             phonemes.extend(toks)
             b = len(phonemes)
-            word_bounds.append({"word": w, "a": a, "b": b, "角色": role})
+            gi = word2sent.get(wi, len(sent_groups) - 1 if sent_groups else 0)
+            word_bounds.append({"word": w, "a": a, "b": b, "角色": role,
+                                "句号": gi + 1})
             print("  %-10s %s" % (w, " ".join(toks) if toks else "（无）"))
 
-    payload = {"文本": text, "音素": phonemes, "词边界": word_bounds}
+        # 汇总每句的音素区间
+        for gi, g in enumerate(sent_groups):
+            idxs = [wi for wi in range(len(words)) if word2sent.get(wi) == gi]
+            if not idxs:
+                continue
+            # 直接用该句首尾词的音素下标
+            first_wb = word_bounds[len(word_bounds) - len(words) + idxs[0]]
+            last_wb = word_bounds[len(word_bounds) - len(words) + idxs[-1]]
+            sentences.append({"句号": len(sentences) + 1,
+                              "文本": " ".join(g),
+                              "a": first_wb["a"], "b": last_wb["b"],
+                              "角色": role})
+
+    payload = {"文本": text, "音素": phonemes, "词边界": word_bounds, "句子边界": sentences}
     os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)
     with open(OUT_JSON, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=1)

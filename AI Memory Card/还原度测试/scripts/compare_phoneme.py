@@ -86,6 +86,56 @@ WORD_ERR_RATIO = 0.40   # 错音占该词音素比例 ≥ 此值
 WORD_ERR_MIN = 2        # 或错音个数 ≥ 此值
 
 
+# 「应读音素 → 一句话发音要领」：命中就附在差异后面，帮学生知道怎么改。
+# 只覆盖中国学习者最常错的音；没覆盖到的跳过（不硬凑）。
+PHONEME_TIPS = {
+    # 双元音（要滑过去，别读成单元音）
+    "oʊ": "双元音：/o/ 滑到 /ʊ/，嘴唇由开到圆收，别读成单元音",
+    "eɪ": "双元音：/e/ 滑到 /ɪ/，嘴角向两边展开，别读成单元音",
+    "aɪ": "双元音：/a/ 滑到 /ɪ/，开口要大、下巴下压，别读成单元音",
+    "aʊ": "双元音：/a/ 滑到 /ʊ/，别读成单元音",
+    "ɔɪ": "双元音：/ɔ/ 滑到 /ɪ/",
+    # 长短元音
+    "iː": "长元音：拉长，舌位高前、嘴角向两边（如 see）",
+    "ɪ": "短元音：短促，舌位略低（如 sit），别和 iː 混",
+    "uː": "长元音：圆唇拉长（如 too）",
+    "ʊ": "短元音：圆唇短促（如 book），别和 uː 混",
+    "ɔː": "长元音：圆唇、下巴下压（如 law）",
+    "ɜː": "长元音：舌中位、嘴角向两边、卷舌拉长（如 bird）",
+    "ɑː": "长元音：大开口（如 father）",
+    "ɑːɹ": "r 化元音：发 ɑː 的同时卷舌（美音 car 的元音）",
+    "æ": "短元音：大开口、下巴用力下压（如 cat），别和 ɛ 混",
+    "ɛ": "短元音：开口适中（如 bed），别和 æ 混",
+    "e": "短元音：开口适中（如 bed），别和 æ 混",
+    "ʌ": "短元音：舌中低、放松（如 cup）",
+    "ə": "弱读央元音：最放松的 /ə/（如 about 的 a）",
+    # 辅音难点
+    "θ": "咬舌音：舌尖轻抵上下齿间送气（清音，如 think），别读成 s",
+    "ð": "咬舌音：同 θ 但声带振动（浊音，如 this），别读成 z/d",
+    "ŋ": "鼻音：舌根抵软腭（如 sing 的 ng），别漏掉也别加 g",
+    "ɹ": "卷舌音：舌尖卷起但不碰硬腭（美音 r），别和 l 混",
+    "l": "边音：舌尖抵上齿龈、气流从舌两侧出，别和 r 混",
+    "t": "爆破音：舌尖抵上齿龈、送气爆破（如 top），别漏掉",
+    "p": "爆破音：双唇闭合、送气爆破",
+    "k": "爆破音：舌根抵软腭、爆破",
+    "v": "唇齿音：上齿轻咬下唇、声带振动，别和 w 混",
+    "w": "双唇圆拢、声带振动，别和 v 混",
+    "z": "齿龈摩擦音：声带振动（如 zoo），别读成 s",
+    "s": "齿龈摩擦音：清音（如 see）",
+}
+
+
+def phoneme_tips(ref_str):
+    """给「应读」音素串附发音要领（命中 PHONEME_TIPS 的音素；没命中返回空串）。"""
+    tips = []
+    for ph in ref_str.split():
+        if ph in PHONEME_TIPS:
+            tips.append("%s:%s" % (ph, PHONEME_TIPS[ph]))
+    if not tips:
+        return ""
+    return "【要领】" + "；".join(tips)
+
+
 # ---- 日志（统一模块，带时间戳；详细模式见 logkit.py 顶部说明）----
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from logkit import log, out, log_setup, log_done, log_step, log_error, VERBOSE
@@ -413,6 +463,109 @@ def map_words_to_audio(text_ph, audio_ph, word_bounds):
     return [0 if o is None else o for o in owner]
 
 
+def detect_partial_coverage(ref, mine):
+    """检测「模仿只覆盖了原音频的一部分」（半截模仿 / 缺句漏句 / 跳开头）。
+
+    背景：学生可能只跟读了原音频的**前半句**（后面整段没录），也可能**从中间
+    开始读**（跳过开头几句）。旧逻辑把这些「没读到的部分」当成逐音的「缺失」
+    扣分 —— 把"没读到"错判成"读错了"。这里改成：先判断模仿实际覆盖到原音频
+    的哪个区间，区间之外没读到的头/尾段不算错。
+
+    判据（用 matching_blocks 的覆盖跨度，排除孤立巧合匹配）：
+      1. 前提：len(mine) <= len(ref) * LEN_RATIO —— 模仿明显短一截才可能是半截，
+         排除"读完整句只是中间读错"的情况。
+      2. 找出所有 size>0 的匹配块；**剔除孤立巧合块**（size==1 且前后 gap>=3 的
+         单音素匹配，如跳开头后模仿首音 oʊ 碰巧对上原音频开头的 oʊ）。
+      3. 用剩下的"有效匹配块"算覆盖区间 [min_a, max_a)：
+         头部漏读 = min_a，尾部漏读 = n - max_a。
+      4. 头/尾漏读段 >= MIN_TAIL 音 且 占原长 >= MIN_TAIL_RATIO，即判半截并截断。
+
+    为什么不用 opcodes 的 delete 段：
+      跳开头时，模仿开头音素和原音频开头「不同但都有音」，difflib 会判成
+      replace（原音频开头 s oʊ w... 被"替换"成模仿的 oʊ æ...），而不是 delete，
+      所以"开头 delete"抓不到漏头。匹配块的覆盖跨度 + 剔除孤立巧合更稳。
+
+    返回 dict：
+      {
+        "半截": bool,                       # 是否判定为半截模仿（漏头或漏尾）
+        "覆盖到原音频位置": int,            # 截断区间末尾音素下标（max_a）
+        "覆盖起始位置": int,                # 截断区间起始音素下标（min_a）
+        "覆盖比例": float,                  # (end-start) / len(ref)
+        "尾巴漏读音数": int,                # 原音频尾部未被覆盖的音素数
+        "头部漏读音数": int,                # 原音频头部未被覆盖的音素数
+        "尾巴漏读词": [str, ...],           # 尾部漏读段对应的词（调用处填）
+        "头部漏读词": [str, ...],           # 头部漏读段对应的词（调用处填）
+      }
+    不判定为半截时，覆盖区间 = [0, n)，覆盖比例 = 1.0。
+    """
+    MIN_TAIL = 3            # 漏读段至少这么多音，才算"整段没读"（小于这个算零星漏读）
+    MIN_TAIL_RATIO = 0.10   # 漏读段占原音频的比例达到此值才截断
+    LEN_RATIO = 0.75        # 模仿音素数 <= 原长 × 此值，才可能是半截（明显短一截）
+    GAP_ISOLATED = 3        # 单音素匹配块与其它匹配块的间隔 >= 此值，视为孤立巧合
+    # ⚠️ 实测结论（selftest.py 变异测试 + 边界扫描，2026-10-18）：
+    #    三个门槛里**只有 LEN_RATIO 真正生效**。逐点扫描 40 音参考：
+    #      mine=30（漏 10 音/25%）→ 判半截；mine=31（漏 9 音/22.5%）→ 不判。
+    #    边界正好落在 LEN_RATIO=0.75 上——因为要触发 MIN_TAIL_RATIO=0.10
+    #    只需漏 4 音，而漏 4 音时 len(mine)=36 > 30，早被 LEN_RATIO 挡在门外。
+    #    即 MIN_TAIL / MIN_TAIL_RATIO 在任何规模下都是**死门槛**（改了不起作用）。
+    #    保留它们是作为"语义说明"与将来放宽 LEN_RATIO 后的兜底；若要精简，
+    #    删这两行不影响当前任何行为——但要先改 selftest 的对应断言。
+
+    n = len(ref)
+    empty = {"半截": False, "覆盖到原音频位置": n, "覆盖起始位置": 0,
+             "覆盖比例": 1.0, "尾巴漏读音数": 0, "头部漏读音数": 0,
+             "尾巴漏读词": [], "头部漏读词": []}
+    if n == 0 or not mine:
+        return empty
+
+    # 前提①：模仿不短一截 → 不可能是"只读了一半"
+    if len(mine) > n * LEN_RATIO:
+        return empty
+
+    sm = difflib.SequenceMatcher(a=ref, b=mine, autojunk=False)
+    blocks = [(a, b, size) for a, b, size in sm.get_matching_blocks() if size > 0]
+    if not blocks:
+        return empty
+
+    # 剔除孤立巧合块（size==1 且前后都离其它块 >= GAP_ISOLATED）
+    def is_isolated(i):
+        a, _b, size = blocks[i]
+        if size != 1:
+            return False
+        prev_gap = a - (blocks[i - 1][0] + blocks[i - 1][2]) if i > 0 else 999
+        next_gap = blocks[i + 1][0] - (a + size) if i + 1 < len(blocks) else 999
+        return prev_gap >= GAP_ISOLATED and next_gap >= GAP_ISOLATED
+
+    kept = [blk for i, blk in enumerate(blocks) if not is_isolated(i)]
+    if not kept:
+        return empty
+
+    min_a = min(blk[0] for blk in kept)
+    max_a = max(blk[0] + blk[2] for blk in kept)
+
+    head_len = min_a
+    tail_len = n - max_a
+    head_partial = (head_len >= MIN_TAIL) and ((head_len / float(n)) >= MIN_TAIL_RATIO)
+    tail_partial = (tail_len >= MIN_TAIL) and ((tail_len / float(n)) >= MIN_TAIL_RATIO)
+    partial = head_partial or tail_partial
+
+    covered_start = head_len if head_partial else 0
+    covered_end = n - tail_len if tail_partial else n
+    covered_len = covered_end - covered_start
+    ratio = covered_len / float(n) if n > 0 else 1.0
+
+    return {
+        "半截": partial,
+        "覆盖到原音频位置": covered_end,
+        "覆盖起始位置": covered_start,
+        "覆盖比例": round(ratio, 4),
+        "尾巴漏读音数": tail_len,
+        "头部漏读音数": head_len,
+        "尾巴漏读词": [],
+        "头部漏读词": [],
+    }
+
+
 def collapse_owner(codes):
     """把归属编码压成 (连读区名列表, 单词名列表)，保持首次出现顺序。"""
     zones_seen, words_seen = [], []
@@ -568,9 +721,17 @@ def write_report(ref, mine, sm, words, ratio, diff_items, problem_words):
             else:
                 who = "（未定位到词）"
             if it["kind"] == "替换":
-                L.append("    [替换] %s：应读 %s  →  实读 %s" % (who, it["ref"], it["my"]))
+                line = "    [替换] %s：应读 %s  →  实读 %s" % (who, it["ref"], it["my"])
+                tip = phoneme_tips(it["ref"])
+                if tip:
+                    line += "   " + tip
+                L.append(line)
             elif it["kind"] == "缺失":
-                L.append("    [缺音] %s：少了 %s" % (who, it["ref"]))
+                line = "    [缺音] %s：少了 %s" % (who, it["ref"])
+                tip = phoneme_tips(it["ref"])
+                if tip:
+                    line += "   " + tip
+                L.append(line)
             else:
                 L.append("    [多音] %s：多了 %s" % (who, it["my"]))
         L.append("")
@@ -652,6 +813,33 @@ def main():
                "".join(sorted({wb.get("角色") or "?" for wb in word_bounds}))))
     else:
         log("   ⚠ 参考音素.json 不可用 → 本次只出音素级结果，不标词", show=True)
+
+    # ---- 半截模仿检测（模仿只覆盖原音频一部分时，只按覆盖范围评分）----
+    log_step("检测模仿覆盖范围")
+    coverage = detect_partial_coverage(ref, mine)
+    if coverage["半截"]:
+        start = coverage["覆盖起始位置"]
+        end = coverage["覆盖到原音频位置"]
+        # 定位漏读的词：头部 = 下标 < start 的词；尾部 = 下标 >= end 的词
+        head_words = [wb["word"] for wb in word_bounds if wb["b"] <= start]
+        tail_words = [wb["word"] for wb in word_bounds if wb["a"] >= end]
+        coverage["头部漏读词"] = head_words
+        coverage["尾巴漏读词"] = tail_words
+        # 截断原音频音素序列：只保留被实际覆盖到的 [start, end) 区间
+        ref = ref[start:end]
+        # 词边界截断：只保留落在 [start, end) 内的词，并把下标平移 -start
+        word_bounds = [dict(wb, a=wb["a"] - start, b=wb["b"] - start)
+                       for wb in word_bounds if wb["a"] >= start and wb["b"] <= end]
+        # 参考音素序列（text_ph）同步截断，保证词边界下标仍落在范围内
+        text_ph = text_ph[start:end]
+        log("   ⚠ 检测到半截模仿：模仿覆盖原音频第 %d~%d 个音素（%.1f%%），"
+            "已按覆盖范围截断重算" % (start, end, coverage["覆盖比例"] * 100), show=True)
+        if head_words:
+            log("   头部漏读词：%s" % " ".join(head_words), show=True)
+        if tail_words:
+            log("   尾部漏读词：%s" % " ".join(tail_words), show=True)
+    else:
+        log("   模仿覆盖完整（%.1f%%），不截断" % (coverage["覆盖比例"] * 100), verbose=True)
 
     # 音素时间轴：帧号 × FRAME_MS
     ref_frame_times = [f * FRAME_MS for f in frames_map["原音频"]]
@@ -753,6 +941,11 @@ def main():
                            "words": names,
                            "zone": bool(zn),
                            "zone_names": zn})
+        # 附发音要领（针对「应读」音素；[多余] 无「应读」音，不给要领）
+        if kind in ("替换", "缺失"):
+            tip = phoneme_tips(" ".join(ref[i1:i2]))
+            if tip:
+                line = line + "   " + tip
         diff_lines.append(line)
 
     out("")
@@ -823,6 +1016,7 @@ def main():
                        "词切分": word_split,
                        "词块": word_blocks,
                        "单词错误": word_errors or None,
+                       "半截模仿": coverage,
                        "参考音素可用": bool(ref_data)}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         # 写盘失败必须让人看见：下游 compare_rhythm / overall_score 都读这个 json，

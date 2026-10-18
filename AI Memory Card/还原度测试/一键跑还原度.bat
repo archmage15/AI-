@@ -2,21 +2,19 @@
 chcp 65001 >nul
 cd /d %~dp0
 rem ============================================================
-rem  Run full fidelity compare - all three steps in one go.
-rem  Put this .bat in the ROOT of the "haindu ceshi" folder.
+rem  一键跑还原度 · 自动路由版
 rem
-rem  Folder layout it expects (all ASCII names):
-rem    %~dp0audio\       input wav files  (yuanyinpin.wav / mofang.wav)
-rem    %~dp0output\      results written by the scripts
-rem    %~dp0scripts\     the three .py programs
-rem    %~dp0models\      phoneme model (read only, auto-downloaded if missing)
-rem    %~dp0xunfei.json   optional API key file, read if present
+rem  由 scripts\run_all.py 统一路由：
+rem    原音频 <= 20 秒 → 单句模式：compare_phoneme → compare_rhythm
+rem    原音频 >  20 秒 → 长音频模式：自动转写/取台词文本 → 生成参考音素表
+rem                      → compare_long（四维度逐句评测）
+rem    最后都跑 overall_score 出综合报告
 rem
-rem  Steps:
-rem    [1] phoneme -> pronunciation + sound change
-rem    [2] rhythm  -> rhythm / pause / pitch
-rem    [3] overall -> weighted score + correction report
-rem  Pauses only once at the end.
+rem  目录约定：
+rem    audio\      放 原音频.wav / 模仿.wav（+ 可选的 转写文本.txt）
+rem    output\     结果（自动生成）
+rem    scripts\    所有 .py（run_all.py 是入口）
+rem    讯飞配置.json 可选：长音频自动转写用（app_id + secret_key）
 rem ============================================================
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
@@ -32,10 +30,6 @@ rem  LOG_VERBOSE=1 also log intermediate numbers (phoneme counts,
 rem                word counts, sub-scores) into the log files.
 rem
 rem  LOG_OFF=1     do not write log files at all (terminal unchanged).
-rem
-rem  Full logs are written to the  output\logs  folder:
-rem    one file appended across runs (full history),
-rem    one file rewritten each run (latest run only).
 rem ------------------------------------------------------------
 rem set LOG_QUIET=1
 rem set LOG_VERBOSE=1
@@ -52,22 +46,7 @@ if not defined PYEXE (
     exit /b 1
 )
 
-echo ============================================================
-echo  [1/3] Phoneme compare  (pronunciation + sound change)
-echo ============================================================
-"%PYEXE%" "%~dp0scripts\compare_phoneme.py" < nul
-
-echo.
-echo ============================================================
-echo  [2/3] Rhythm / intonation compare
-echo ============================================================
-"%PYEXE%" "%~dp0scripts\compare_rhythm.py" < nul
-
-echo.
-echo ============================================================
-echo  [3/3] Overall fidelity score + report
-echo ============================================================
-"%PYEXE%" "%~dp0scripts\overall_score.py" < nul
+"%PYEXE%" "%~dp0scripts\run_all.py" < nul
 
 echo.
 echo ============================================================

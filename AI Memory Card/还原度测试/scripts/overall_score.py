@@ -54,6 +54,23 @@ DIMENSIONS = [
 # 注：语调暂不出分（计划书 §4）—— 不进 DIMENSIONS、不参与加权；
 #    语调分仍从 rhythm["语调分"] 读，仅供报告显示。
 
+# ---- 评测模式（history.json 必须记，否则跨模式比分会误导）----
+# 单句 = 原音频 ≤20s；长音频 = 逐句评测。两者的素材长度、评分口径都不同，
+# 综合分**不可横向比**。混在一起比会得出"我进步了"的错误结论
+# （实测踩过：63.2 是 4 秒单句、67.2 是 72 秒长音频，被写成"↑+4.0"）。
+MODE_LONG = "长音频"
+MODE_SINGLE = "单句"
+
+
+def detect_mode(phoneme):
+    """从音素对比.json 判定本次是长音频还是单句模式。
+
+    判据用 `is not None` 而非真值判断：compare_long.py 一定会写「长音频」段
+    （内含 模式/句子/四个分项等 7 个键），但若哪天它写了空段，
+    `phoneme.get("长音频") or None` 会把"存在但为空"误判成单句。
+    """
+    return MODE_LONG if phoneme.get("长音频") is not None else MODE_SINGLE
+
 
 # ---- 日志（统一模块，带时间戳；详细模式见 logkit.py 顶部说明）----
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -82,11 +99,30 @@ def read_history():
         return []
 
 
-def append_history(overall, parts):
-    """把本次综合分追加进 history.json，供报告显示「上次 vs 这次」的进步。"""
+def find_prev_same_mode(hist, mode):
+    """在历史里**往回找**最近一条同模式的记录。
+
+    为什么不能直接用 hist[-2]（旧版做法）：
+      单句（4秒）与长音频（72秒）的综合分口径不同，跨模式比会得出
+      "进步了 +4.0" 的假结论 —— 分数变化其实来自素材变化，不是练得更好。
+      宁可不给对比，也不给错的对比。
+    旧记录没有「模式」字段 → 一律跳过（无法判断模式 = 不敢用来比）。
+    """
+    for entry in reversed(hist):
+        if isinstance(entry, dict) and entry.get("模式") == mode:
+            return entry
+    return None
+
+
+def append_history(overall, parts, mode):
+    """把本次综合分追加进 history.json，供报告显示「上次 vs 这次」的进步。
+
+    mode 必须记（单句/长音频）—— 否则报告会把两种模式混着比。
+    """
     entry = {
         "时间": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "综合分": round(overall, 1),
+        "模式": mode,
         "分项": {k: (round(parts[k], 1) if parts.get(k) is not None else None)
                   for k, _w in DIMENSIONS},
     }
@@ -165,12 +201,17 @@ def rhythm_section(rhythm, key):
 def collect_parts(phoneme, rhythm):
     """按维度取分：键须与 DIMENSIONS 对齐。加维度时改这里（全局唯一取数处）。"""
     stat = phoneme.get("对齐统计")
+    # 长音频模式：只信 compare_long.py 写的 节奏对比.json（数据源带标记），
+    # 防止把上一次单句运行的陈旧数据混进长音频报告（实测踩过）。
+    long_mode = bool(phoneme.get("长音频"))
+    src = ((rhythm or {}).get("节奏") or {}).get("数据源") or ""
+    rhythm_ok = bool(rhythm) and (not long_mode or "compare_long" in src)
     return {
         "发音": score_pronunciation(stat),
         "音变": score_phoneme_change(stat),
-        "语调": rhythm.get("语调分"),
-        "节奏": rhythm.get("节奏分"),
-        "重音位置": score_stress_position(rhythm),
+        "语调": rhythm.get("语调分") if rhythm_ok else None,
+        "节奏": rhythm.get("节奏分") if rhythm_ok else None,
+        "重音位置": score_stress_position(rhythm) if rhythm_ok else None,
     }
 
 
@@ -220,10 +261,18 @@ def main():
         out("X 缺少 音素对比.json —— 请先跑 compare_phoneme.py（或一键 bat）。")
         log_done("（缺前置数据，提前退出）")
         return
+    long_mode = bool(phoneme.get("长音频"))
     if rhythm is None:
-        out("X 缺少 节奏对比.json —— 请先跑 compare_rhythm.py（或一键 bat）。")
-        log_done("（缺前置数据，提前退出）")
-        return
+        if long_mode:
+            # 长音频模式但没跑出 节奏对比.json：用空 dict 占位
+            # （collect_parts 里 rhythm_ok 会把它判为不可信，相关项不参与加权）
+            rhythm = {}
+        else:
+            out("X 缺少 节奏对比.json —— 请先跑 compare_rhythm.py（或一键 bat）。")
+            log_done("（缺前置数据，提前退出）")
+            return
+    if long_mode:
+        log("   长音频模式：发音/音变/节奏/重音 均由 compare_long.py 逐句评测汇总", verbose=True)
     log("   音素对比.json：相似度 %s，差异 %d 条"
         % (phoneme.get("相似度"), len(phoneme.get("差异") or [])), verbose=True)
     log("   节奏对比.json：节奏 %s ｜ 语调 %s ｜ 重音位置 %s"
@@ -256,7 +305,7 @@ def main():
         out("   音素：替换 %d ｜ 缺失 %d ｜ 多余 %d ｜ 匹配 %d（原生共 %d 音）"
             % (stat.get("替换音数", 0), stat.get("缺失音数", 0), stat.get("多余音数", 0),
                stat.get("匹配音数", 0), stat.get("原生音数", 0)))
-    if rhythm:
+    if rhythm and not phoneme.get("长音频"):
         net = rhythm_section(rhythm, "整句净时长") or {}
         ps = rhythm_section(rhythm, "句子边界停顿") or {}
         st = rhythm.get("重音_信号") or {}
@@ -294,7 +343,7 @@ def main():
         log("（写 json 失败：%s）" % e, show=True)
 
     # ---- 记历史（供报告显示进步）----
-    append_history(overall, parts)
+    append_history(overall, parts, detect_mode(phoneme))
 
     # ---- 写报告（给人）----
     try:
@@ -316,19 +365,51 @@ def write_report(overall, parts, phoneme, rhythm):
     L.append("")
     L.append("原音频.wav  vs  模仿.wav（跟读还原度）")
     L.append("")
+    # 半截模仿提示：模仿只覆盖原音频一部分时，明确告诉用户本次只按已模仿部分评分
+    coverage = (phoneme.get("半截模仿") or {})
+    if coverage.get("半截"):
+        long_info = phoneme.get("长音频") or {}
+        if long_info:
+            # 长音频格式：按句报
+            L.append("⚠ 检测到「半截模仿」：你只跟读到 %d / %d 句（%.0f%%）。"
+                     % (coverage.get("已读句数", 0), coverage.get("总句数", 0),
+                        coverage.get("覆盖比例", 0) * 100))
+            missed = coverage.get("漏句") or []
+            if missed:
+                L.append("   未读到的句子（不计分）：")
+                for m in missed:
+                    L.append("     · 句%s：%s" % (m.get("句号"), m.get("文本", "")))
+        else:
+            head = coverage.get("头部漏读词") or []
+            tail = coverage.get("尾巴漏读词") or []
+            L.append("⚠ 检测到「半截模仿」：你只跟读到原音频的 %.1f%%。" % (coverage.get("覆盖比例", 0) * 100))
+            if head:
+                L.append("   开头没读到的部分：%s" % " ".join(head))
+            if tail:
+                L.append("   结尾没读到的部分：%s" % " ".join(tail))
+        L.append("   本次只按已模仿到的部分评分，未读到的部分不算错。")
+        L.append("")
     L.append("综合还原度：%.1f / 100     等级：%s" % (overall, grade(overall)))
-    hist = read_history()
-    if len(hist) >= 2:
-        prev = hist[-2]
-        prev_score = prev.get("综合分")
-        if prev_score is not None:
-            diff = round(overall, 1) - prev_score
-            if abs(diff) < 0.05:
-                delta = "持平"
-            else:
-                delta = ("↑ %+.1f" if diff > 0 else "↓ %+.1f") % diff
-            L.append("   上次 %.1f 分（%s）→ 这次 %.1f 分，%s"
-                     % (prev_score, prev.get("时间", "?"), overall, delta))
+    # 进步对比：**只跟同模式的历史记录比**。单句(≤20s) 与长音频(逐句评测)
+    # 的素材长度、评分口径都不同，跨模式比会写出"进步 +4.0"这种假结论
+    # （分数变化来自素材变化，不是练得更好）。找不到同模式记录就不显示，
+    # 并说明原因 —— 宁可不给对比，也不给错的对比。
+    mode = detect_mode(phoneme)
+    L.append("（本次：%s模式）" % mode)
+    prev = find_prev_same_mode(read_history(), mode)
+    if prev and prev.get("综合分") is not None:
+        prev_score = prev["综合分"]
+        diff = round(overall, 1) - prev_score
+        if abs(diff) < 0.05:
+            delta = "持平"
+        else:
+            delta = ("↑ %+.1f" if diff > 0 else "↓ %+.1f") % diff
+        L.append("   上次%s模式 %.1f 分（%s）→ 这次 %.1f 分，%s"
+                 % (mode, prev_score, prev.get("时间", "?"), overall, delta))
+    else:
+        L.append("   暂无同模式（%s）的历史记录可对比 —— 已跑过 %d 次，"
+                 "其中能用于对比的是 0 次。"
+                 % (mode, len(read_history())))
     L.append("")
     L.append("-" * 60)
     L.append("一、分项得分（发音最重，其余持平）")
@@ -356,16 +437,22 @@ def write_report(overall, parts, phoneme, rhythm):
     # 原句
     words = phoneme.get("词表") or []
     problem_words = set()
-    for d in diffs:
-        for seg in d.split("【"):
-            if "】" not in seg:
-                continue
-            inner = seg.split("】")[0]
-            # inner 形如：单词 "so"  或  单词 "Where" → "are" 之间
-            for q in inner.split('"')[1::2]:        # 取所有被双引号括起的词
-                w = q.strip()
-                if w:
-                    problem_words.add(w)
+    long_problem = phoneme.get("问题词")
+    if long_problem:
+        # 长音频模式：用 compare_long 挑好的"问题严重词"（错音≥2 或比例≥40%）。
+        # 不能改成解析差异行的标签——那样满句都是框，等于没框（实测踩过）。
+        problem_words |= set(long_problem)
+    else:
+        for d in diffs:
+            for seg in d.split("【"):
+                if "】" not in seg:
+                    continue
+                inner = seg.split("】")[0]
+                # inner 形如：单词 "so"  或  单词 "Where" → "are" 之间
+                for q in inner.split('"')[1::2]:        # 取所有被双引号括起的词
+                    w = q.strip()
+                    if w:
+                        problem_words.add(w)
     if words:
         sent = " ".join(("【%s】" % w["word"]) if w["word"] in problem_words else w["word"]
                        for w in words)
@@ -379,7 +466,10 @@ def write_report(overall, parts, phoneme, rhythm):
     L.append("-" * 60)
     L.append("四、节奏 / 语调")
     L.append("-" * 60)
-    if rhythm:
+    long_src = "compare_long" in (((rhythm or {}).get("节奏") or {}).get("数据源") or "")
+    if phoneme.get("长音频") and not long_src:
+        L.append("    长音频模式但缺 节奏对比.json —— 请先跑 compare_long.py。")
+    elif rhythm:
         net = rhythm_section(rhythm, "整句净时长")
         ps = rhythm_section(rhythm, "句子边界停顿")
         st = rhythm.get("重音_信号") or {}

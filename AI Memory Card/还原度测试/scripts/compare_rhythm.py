@@ -462,33 +462,59 @@ def score_blocks(pairs):
 
 # ---------------- 画图 ----------------
 def plot_blocks(items, title="节奏对比（按词块序号）"):
+    """逐块时长对比柱状图。横轴标签自适应：
+      - 块数 <= LABEL_ALL_MAX（30）：每块都标「序号.词」，转 30°（原行为，单句模式）
+      - 块数更多（长音频）：图幅拉宽、**每块都标「序号.词」**但转 90°、字调小。
+        90° 旋转把横向拥挤转成纵向堆叠（每标签横向只占一字宽 ~8px，
+        75 块在 18 英寸图上每人 28px，不会碰）；并对「相对差最大的 5 个块」
+        挂判定提示（原来给所有 ≥30% 的块都挂，横排必叠）
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    labels = ["%d.%s" % (it["序号"], it["块"]) for it in items]
-    x = np.arange(len(items))
+    n = len(items)
+    x = np.arange(n)
     dr = [it["原音频时长"] for it in items]
     dm = [it["我的时长"] for it in items]
     width = 0.38
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    LABEL_ALL_MAX = 30
+    dense = n > LABEL_ALL_MAX
+    if dense:
+        fig, ax = plt.subplots(figsize=(18, 7))
+        rot, fs = 90, 7
+    else:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        rot, fs = 30, 9
+
     ax.bar(x - width / 2, dr, width, label="原音频", color="#c0392b")
     ax.bar(x + width / 2, dm, width, label="我的模仿", color="#2471a3")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+    ax.set_xticks([int(i) for i in x])
+    ax.set_xticklabels(["%d.%s" % (it["序号"], it["块"]) for it in items],
+                       rotation=rot, ha="right", fontsize=fs)
     ax.set_ylabel("块时长 (秒)")
-    ax.set_title(title + "   ·   横轴是词块序号，不是绝对时间")
+    ax.set_title(title + "   ·   横轴是词块序号，不是绝对时间"
+                 + ("（块多，标签竖排；提示只标差异最大的5块）" if dense else ""))
     ax.grid(alpha=0.25, axis="y")
     ax.legend()
     # 标出差异大的块
-    for i, it in enumerate(items):
-        if abs(it["相对差"]) >= REL_FAST:
-            ax.annotate(it["判定"], (i, max(dr[i], dm[i])),
+    if not dense:
+        for i, it in enumerate(items):
+            if abs(it["相对差"]) >= REL_FAST:
+                ax.annotate(it["判定"], (i, max(dr[i], dm[i])),
+                            textcoords="offset points", xytext=(0, 6),
+                            ha="center", fontsize=8, color="#7d3c98")
+    else:
+        # 长音频：只标「相对差最大」的 5 个块，词+判定都带上，避免叠字
+        worst = sorted(range(n), key=lambda i: -abs(items[i]["相对差"]))[:5]
+        for i in worst:
+            ax.annotate("%s %s" % (items[i]["块"], items[i]["判定"]),
+                        (i, max(dr[i], dm[i])),
                         textcoords="offset points", xytext=(0, 6),
-                        ha="center", fontsize=8, color="#7d3c98")
+                        ha="center", fontsize=7, color="#7d3c98", rotation=90)
     fig.tight_layout()
     fig.savefig(OUT_PNG, dpi=120)
     out("图已保存：" + OUT_PNG)
