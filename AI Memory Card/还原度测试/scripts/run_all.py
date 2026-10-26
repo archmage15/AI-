@@ -30,8 +30,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC_DIR = os.path.join(ROOT, "audio")
 
-REF_WAV = os.path.join(SRC_DIR, "原音频.wav")
-MY_WAV = os.path.join(SRC_DIR, "模仿.wav")
 REF_PHONEME_JSON = os.path.join(SRC_DIR, "参考音素.json")
 TRANSCRIBE_TXT = os.path.join(SRC_DIR, "转写文本.txt")
 XUNFEI_CONFIG = os.path.join(ROOT, "讯飞配置.json")
@@ -40,6 +38,10 @@ LONG_AUDIO_S = 20.0        # 原音频超过此时长（秒）走长音频模式
 
 sys.path.insert(0, HERE)
 from logkit import log, out, log_setup, log_done, log_step, log_error
+from audio_paths import find_audio_pair, missing_hint, short_name
+
+# 音频格式无关：mp3 / wav / flac / ogg 都认，认不出返回 None
+REF_WAV, MY_WAV = find_audio_pair(SRC_DIR)
 
 
 def audio_duration(path):
@@ -138,15 +140,15 @@ def main():
     out("   还原度测试 · 一键跑（自动路由）")
     out("=" * 62)
 
-    if not (os.path.exists(REF_WAV) and os.path.exists(MY_WAV)):
-        out("X 没找到音频文件，请把两个 wav 放进 audio\\：")
-        out("    " + REF_WAV)
-        out("    " + MY_WAV)
+    if not (REF_WAV and MY_WAV):
+        out("X 没找到音频文件，请把两个音频放进 audio\\：")
+        out(missing_hint([("原音频", REF_WAV), ("模仿", MY_WAV)], SRC_DIR))
         log_done("（缺音频，提前退出）")
         return
 
     dur = audio_duration(REF_WAV) or 0.0
     long_mode = dur > LONG_AUDIO_S
+    out("输入音频：%s（%.1fs） vs %s" % (short_name(REF_WAV), dur, short_name(MY_WAV)))
     out("原音频时长 %.1f 秒 → %s" % (dur, "长音频模式（逐句评测）" if long_mode else "单句模式"))
 
     if long_mode:

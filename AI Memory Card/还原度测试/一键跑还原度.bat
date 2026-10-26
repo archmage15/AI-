@@ -11,7 +11,8 @@ rem                      → compare_long（四维度逐句评测）
 rem    最后都跑 overall_score 出综合报告
 rem
 rem  目录约定：
-rem    audio\      放 原音频.wav / 模仿.wav（+ 可选的 转写文本.txt）
+rem    audio\      放 原音频.* / 模仿.*（mp3 / wav / flac / ogg 任意格式）
+rem                + 可选的 转写文本.txt
 rem    output\     结果（自动生成）
 rem    scripts\    所有 .py（run_all.py 是入口）
 rem    讯飞配置.json 可选：长音频自动转写用（app_id + secret_key）

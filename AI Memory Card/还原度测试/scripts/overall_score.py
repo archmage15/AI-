@@ -363,7 +363,9 @@ def write_report(overall, parts, phoneme, rhythm):
     L.append("   还原度综合报告")
     L.append("=" * 60)
     L.append("")
-    L.append("原音频.wav  vs  模仿.wav（跟读还原度）")
+    from audio_paths import find_audio_pair, short_name
+    _ref, _my = find_audio_pair()
+    L.append("%s  vs  %s（跟读还原度）" % (short_name(_ref), short_name(_my)))
     L.append("")
     # 半截模仿提示：模仿只覆盖原音频一部分时，明确告诉用户本次只按已模仿部分评分
     coverage = (phoneme.get("半截模仿") or {})

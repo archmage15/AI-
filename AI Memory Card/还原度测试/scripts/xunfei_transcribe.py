@@ -16,7 +16,7 @@ r"""讯飞录音文件转写（LFASR 标准版）· 长音频自动转写
 音频要求：wav/flac/opus/m4a/mp3，≤500M、≤5h，8k/16k 采样率。
      44.1k 立体声会先降成 16k 单声道（体积砍到 1/5，转写更快）。
 
-用法：python scripts\xunfei_transcribe.py              # 转写 audio\原音频.wav
+用法：python scripts\xunfei_transcribe.py              # 转写 audio\原音频.*
      python scripts\xunfei_transcribe.py <wav路径>     # 指定其他音频
 """
 import base64
@@ -153,9 +153,13 @@ def main():
     out("=" * 62)
 
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    src = args[0] if args else os.path.join(SRC_DIR, "原音频.wav")
-    if not os.path.exists(src):
-        out("X 找不到音频文件：" + src)
+    if args:
+        src = args[0]
+    else:
+        from audio_paths import find_audio
+        src = find_audio("原音频", SRC_DIR)
+    if not src or not os.path.exists(src):
+        out("X 找不到音频文件" + ("：" + src if src else "：请把音频放进 " + SRC_DIR))
         log_done("（缺音频，提前退出）")
         return
 

@@ -9,7 +9,8 @@ r"""还原度对比 · 第二块：音素
   - 输出 eSpeak 风格音素（接近 IPA）
 
 用法：
-  1. 把两个音频放进 audio\ 文件夹，命名成：原音频.wav 和 模仿.wav
+  1. 把两个音频放进 audio\ 文件夹，命名成：原音频.* 和 模仿.*
+     （扩展名随意：mp3 / wav / flac / ogg 都可以，m4a / aac 不行）
   2. 双击 scripts\run_phoneme.bat（或根目录的 一键跑还原度.bat）
   3. 屏幕出对比结果，结果写到 output\ 文件夹
 
@@ -55,8 +56,8 @@ OUT_DIR = os.path.join(ROOT, "output")
 for _d in (SRC_DIR, OUT_DIR):
     os.makedirs(_d, exist_ok=True)
 
-REF_FILE = os.path.join(SRC_DIR, "原音频.wav")
-MY_FILE = os.path.join(SRC_DIR, "模仿.wav")
+REF_FILE = None      # 运行时按格式探测（见 audio_paths），可能是 .mp3 / .wav / .flac
+MY_FILE = None
 OUT_JSON = os.path.join(OUT_DIR, "音素对比.json")
 # 给人看的报告（json 留给机器/AI，这份是纯文本、人读的）
 OUT_REPORT = os.path.join(OUT_DIR, "音素对比_报告.txt")
@@ -139,6 +140,9 @@ def phoneme_tips(ref_str):
 # ---- 日志（统一模块，带时间戳；详细模式见 logkit.py 顶部说明）----
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from logkit import log, out, log_setup, log_done, log_step, log_error, VERBOSE
+from audio_paths import find_audio_pair, missing_hint, short_name
+
+REF_FILE, MY_FILE = find_audio_pair(SRC_DIR)
 
 
 def load_ref_phonemes():
@@ -687,7 +691,7 @@ def write_report(ref, mine, sm, words, ratio, diff_items, problem_words):
     L.append("   音素对比报告（发音 + 音变）")
     L.append("=" * 60)
     L.append("")
-    L.append("原音频.wav  vs  模仿.wav")
+    L.append("%s  vs  %s" % (short_name(REF_FILE), short_name(MY_FILE)))
     L.append("整体音素相似度：%.1f / 100" % ratio)
     L.append("")
     # 一、逐音对照：横排，上行=原音频，下行=我的，★=不一样
@@ -764,11 +768,10 @@ def main():
     out("   还原度对比 · 音素")
     out("=" * 62)
 
-    if not (os.path.exists(REF_FILE) and os.path.exists(MY_FILE)):
+    if not (REF_FILE and MY_FILE):
         out("")
-        out("X 没找到音频文件。请把两个 wav 放进本文件夹：")
-        out("    " + REF_FILE)
-        out("    " + MY_FILE)
+        out("X 没找到音频文件：")
+        out(missing_hint([("原音频", REF_FILE), ("模仿", MY_FILE)], SRC_DIR))
         log_done("（音频缺失，提前退出）")
         return
 

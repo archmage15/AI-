@@ -18,7 +18,8 @@ r"""还原度对比 · 第一块：节奏 / 重音
     - 只报差异，不下"你错了"的结论（对错取决于说话意图，机器判不了）
 
 用法：
-  1. 把两个音频放进 audio\ 文件夹，命名成：原音频.wav 和 模仿.wav
+  1. 把两个音频放进 audio\ 文件夹，命名成：原音频.* 和 模仿.*
+     （扩展名随意：mp3 / wav / flac / ogg 都可以，m4a / aac 不行）
   2. 双击 scripts\run_rhythm.bat（或根目录的 一键跑还原度.bat）
   3. 屏幕出报告，结果写到 output\ 文件夹
 
@@ -50,8 +51,8 @@ OUT_DIR = os.path.join(ROOT, "output")
 for _d in (SRC_DIR, OUT_DIR):
     os.makedirs(_d, exist_ok=True)
 
-REF_FILE = os.path.join(SRC_DIR, "原音频.wav")
-MY_FILE = os.path.join(SRC_DIR, "模仿.wav")
+REF_FILE = None      # 运行时按格式探测（见 audio_paths），可能是 .mp3 / .wav / .flac
+MY_FILE = None
 OUT_PNG = os.path.join(OUT_DIR, "节奏对比.png")
 OUT_PNG_PITCH = os.path.join(OUT_DIR, "音高对比.png")
 OUT_JSON = os.path.join(OUT_DIR, "节奏对比.json")   # 给机器/综合评分器用
@@ -76,6 +77,9 @@ NEIGH_K = 0.5           # 落差阈值：块值 - 邻居中位数 >= K·σ → �
 # ---- 日志（统一模块，带时间戳；详细模式见 logkit.py 顶部说明）----
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from logkit import log, out, log_setup, log_done, log_step, log_error, VERBOSE
+from audio_paths import find_audio_pair, missing_hint, short_name
+
+REF_FILE, MY_FILE = find_audio_pair(SRC_DIR)
 
 
 # ---------------- 读音频 + 变单声道 + 重采样 ----------------
@@ -391,6 +395,229 @@ def mark_stress_neighborhood(feats, blocks, R=NEIGH_R, K=NEIGH_K, roles=None):
     return marked, detail
 
 
+# ---------------- 重音明细渲染（先摊开依据，再下纠错结论） ----------------
+# ⚠️ 顺序是刻意的：**先列全两侧每一块的判定依据**（含没突出的），
+#    读者才能自己看出「为什么这个突出、那个没突出」，再看漏/多结论。
+#    以前只打印「哪几块突出」，依据全在 json 里，等于要求读者自己去翻机器数据。
+def _pad(text, width):
+    """按显示宽度左对齐补空格（中文算 2 格）。"""
+    w = sum(2 if ord(c) > 0x2E80 else 1 for c in text)
+    return text + " " * max(0, width - w)
+
+
+def render_stress_detail(detail, label, miss=(), extra=()):
+    """把一侧的全部重音判定明细渲染成文本行（返回 list[str]）。
+
+    每个块一行，格式：
+        #序号词  角色  三路「归一值(落差σ)」  判定 + 命中路
+      ★ = 该侧判定为突出，○ = 没突出，M = 原音频有我漏了，X = 我多出来的
+
+    miss / extra 传入的是**对侧**的差集序号，只影响本侧标记，不改判定。
+    """
+    if not detail:
+        return ["   （该侧没有词块）"]
+    miss, extra = set(miss), set(extra)
+
+    def cue_cell(d, c):
+        """一格：归一值 + (落差σ)。缺该路数据 → '-'。"""
+        v = (d.get("归一值") or {}).get(c)
+        z = (d.get("落差σ") or {}).get(c)
+        if v is None:
+            return "-"
+        return "%.2f(%+.2f)" % (v, z if z is not None else 0.0)
+
+    def word_of(d):
+        """detail 里的「词」可能是 '+'.join(...) 字符串，也可能是原始 list（json 回读/测试）。"""
+        w = d.get("词")
+        if isinstance(w, (list, tuple)):
+            w = "+".join(str(x) for x in w)
+        return w or "?"
+
+    def dwidth(text):
+        return sum(2 if ord(c) > 0x2E80 else 1 for c in text)
+
+    w_no = max([len(str(d["序号"])) for d in detail] + [2])
+    w_word = max(dwidth(word_of(d)) for d in detail)
+    w_role = max(dwidth(d.get("角色") or "-") for d in detail)
+
+    lines = ["   【%s】共 %d 块，其中判定突出 %d 块"
+             % (label, len(detail), sum(1 for d in detail if d.get("突出")))]
+    head = "   %s %s  %s  %s  %s  %s" % (
+        _pad("#", w_no + 1), _pad("词", w_word), _pad("角色", w_role),
+        _pad("音高 半音(z)", 15), _pad("响度 倍(z)", 15), _pad("时长 倍(z)", 15))
+    lines.append(head)
+    lines.append("   " + "-" * (len(head) - 3))
+    for d in detail:
+        no = d["序号"]
+        if no in miss:
+            flag = "M"
+        elif no in extra:
+            flag = "X"
+        else:
+            flag = "★" if d.get("突出") else "○"
+        hits = "/".join(d.get("命中路") or []) or "-"
+        lines.append("   %s %s  %s  %s  %s  %s  %s %s"
+                     % (_pad(str(no), w_no + 1), _pad(word_of(d), w_word),
+                        _pad(d.get("角色") or "-", w_role),
+                        _pad(cue_cell(d, "音高"), 15),
+                        _pad(cue_cell(d, "响度"), 15),
+                        _pad(cue_cell(d, "时长"), 15),
+                        flag, hits))
+    lines.append("   图例：★ 该侧突出  ○ 不突出  M 原音频有、你漏了  X 你多出来的"
+                 "   （z = 相对同角色邻居中位数的落差 ÷ σ）")
+    # 「-」是「该路没数据」，不是 0 —— 音高需浊音才测得到。统计一下免得被当成 bug。
+    miss_pitch = sum(1 for d in detail
+                     if (d.get("归一值") or {}).get("音高") is None)
+    if miss_pitch:
+        lines.append("   注：%d/%d 块音高显示为 -（该处测不到浊音，非 0 值），"
+                     "这几块只能靠响度/时长两路判定。"
+                     % (miss_pitch, len(detail)))
+    return lines
+
+
+def render_stress_verdict(nr, nm, marked_r, marked_m):
+    """纠错结论（依赖上面的明细才看得懂）。返回 list[str]。"""
+    miss = sorted(set(marked_r) - set(marked_m))
+    extra = sorted(set(marked_m) - set(marked_r))
+    hit = sorted(set(marked_r) & set(marked_m))
+
+    def name(seq, table):
+        return ("、".join("#%d %s" % (i, table.get(i, "?")) for i in seq) or "无")
+
+    return [
+        "   → 漏（原音频有、我没有）：%s" % name(miss, nr),
+        "   → 多（我有、原音频没有）：%s" % name(extra, nm),
+        "   → 命中：%s" % name(hit, nr),
+        "   （重音位置分只罚漏不罚多：多读不算错，但漏读要扣）",
+    ]
+
+
+# ---------------- 重点词清单（算法直接给结论，不让用户自己从表里找） ----------------
+# 大法师 10-21：光给「哪几块漏了」不够 —— 用户要的是**要重读哪个词、怎么改**。
+# 下面这个函数把两侧的归一值/落差σ换算成可执行的说法。
+#
+# ⚠️⚠️ **不给假精确的数字**（10-21 返工踩过）：
+#   第一版直接输出「再拖长 298%」「往下压 11.3 个半音」—— 这些是相对**同角色邻居中位**
+#   的比值差，邻居组随素材变，298% 没有可执行意义（用户没法"拖长 3 倍"），
+#   11.3 个半音也超出音域常识。**精确的假数字比不给更糟**。
+#   改成：方向（往上/往下/更响/更轻/拖长/缩短）+ 幅度三档（轻微/明显/很大）。
+#   依据仍是已算好的量（归一值差 + 落差σ），只是表达成人能执行的粒度。
+#
+# 幅度分档（按归一值差，音高用半音、响度/时长用百分比）：
+#   轻微 < 1 半音 / <15%   明显 1~3 半音 / 15~50%   很大 > 3 半音 / > 50%
+def _magnitude(cue, gap):
+    """把归一值差换算成三档幅度标签。"""
+    if cue == "音高":
+        a = abs(gap)
+        if a < 1.0:
+            return "轻微"
+        return "明显" if a < 3.0 else "很大"
+    a = abs(gap) * 100.0
+    if a < 15:
+        return "轻微"
+    return "明显" if a < 50 else "很大"
+
+
+def _too_extreme(cue, gap):
+    """差值大到不像「读法差异」，更像测量异常（块边界/静音/吞音）→ 不给方向建议。
+
+    实测踩过：某块时长比值差 298% —— 那是「原音频这块 1.2 倍、我的 0.3 倍」，
+    也就是我这块几乎没读出时长（吞音或边界切错），不是「要拖长 3 倍」。
+    对着这种数给建议是误导。
+    """
+    if cue == "音高":
+        return abs(gap) > 12.0        # 12 个半音 = 一个八度，正常语流到不了
+    return abs(gap) >= 3.0           # 3 倍差 = 差一个数量级，多半是异常不是读法
+
+
+def _cue_advice(cue, ref_val, my_val):
+    """一路信号的改法建议（方向 + 幅度档位）。gap = 原侧领先量。"""
+    if ref_val is None or my_val is None:
+        return "（该路测不到，无法量化）"
+    gap = ref_val - my_val
+    if cue == "音高":
+        if abs(gap) < 0.5:
+            return "音高已接近"
+        # ⚠️ 音高路是**双向**的（升调/降调都算 prominence，因为英语重音可由降调实现）。
+        #    所以 gap<0 有两种含义：① 原声靠降调实现重读、你要学它降下来；
+        #    ② 原声抬高了、你没抬。分不清是哪种（n=1 未标定），
+        #    **不能**武断说「压低」—— 措辞改成中性并提示两种可能。
+        if gap > 0:
+            if _too_extreme(cue, gap):
+                return "音高差得反常（多半是这块没读出来/切边错误，不是读法问题）"
+            return "音高往上挑（%s）" % _magnitude(cue, gap)
+        if _too_extreme(cue, gap):
+            return "音高差得反常（多半是这块没读出来/切边错误，不是读法问题）"
+        return "音高和原声反了（%s）· 原声可能是降调重读，你听着原声往哪边走就往哪边走" \
+            % _magnitude(cue, gap)
+    if cue == "响度":
+        if abs(gap) * 100 < 5:
+            return "响度已接近"
+        if _too_extreme(cue, gap):
+            return "响度差得反常（多半是这块没读出来/切边错误，不是读法问题）"
+        return ("再读响些（%s）" % _magnitude(cue, gap)) if gap > 0 \
+            else ("读轻些（%s）" % _magnitude(cue, gap))
+    if cue == "时长":
+        if abs(gap) * 100 < 8:
+            return "时长已接近"
+        if _too_extreme(cue, gap):
+            return "时长差得反常（多半是这块没读出来/切边错误，不是读法问题）"
+        return ("拖长些（%s）" % _magnitude(cue, gap)) if gap > 0 \
+            else ("缩短些（%s）" % _magnitude(cue, gap))
+    return cue
+
+
+def render_focus_words(detail_r, detail_m, nr, nm):
+    """输出「重点词清单」：原音频突出 + 你漏掉的词，逐个说清怎么改。
+
+    返回 list[str]。这是给人**照着念**的清单，不是给机器的。
+    """
+    by_no_r = {d["序号"]: d for d in detail_r}
+    by_no_m = {d["序号"]: d for d in detail_m}
+    marked_r = {d["序号"] for d in detail_r if d.get("突出")}
+    marked_m = {d["序号"] for d in detail_m if d.get("突出")}
+    miss = sorted(marked_r - marked_m)
+
+    lines = []
+    if not miss:
+        lines.append("   ✅ 原音频的每个重点词你都重读了 —— 没有漏读，不用改。")
+        return lines
+
+    lines.append("   重点词清单（原音频重读、你没重读 → 照这个单子练）：")
+    for no in miss:
+        dr = by_no_r.get(no)
+        dm = by_no_m.get(no)
+        word = (dr or {}).get("词") or nm.get(no) or nr.get(no) or "?"
+        cues = (dr or {}).get("命中路") or []
+        tips = []
+        for cue in ("音高", "响度", "时长"):
+            if cue not in cues:
+                continue
+            rv = ((dr or {}).get("归一值") or {}).get(cue)
+            mv = ((dm or {}).get("归一值") or {}).get(cue)
+            tips.append(_cue_advice(cue, rv, mv))
+        lines.append("   · %-16s → %s" % (word, "；".join(tips) if tips else "（无量化建议）"))
+    lines.append("   怎么用：先只练上面这几个词。重音 = 把这个字读得更突出"
+                 "（挑高 / 读响 / 拖长），别整句一起使劲。")
+    lines.append("   ⚠ 幅度是相对同句其他词估的，不是精确目标 —— "
+                 "照着「更突出」的方向练，不必追求具体数值。")
+    return lines
+
+
+def render_extra_words(detail_r, detail_m, nr, nm):
+    """输出「你多出来的重音」：原音频没重读、你重读了 —— 不扣分，但可以听听是不是读过头。"""
+    marked_r = {d["序号"] for d in detail_r if d.get("突出")}
+    marked_m = {d["序号"] for d in detail_m if d.get("突出")}
+    extra = sorted(marked_m - marked_r)
+    if not extra:
+        return []
+    words = "、".join(str((d.get("词") or nm.get(d["序号"]) or "?"))
+                     for d in detail_m if d["序号"] in extra)
+    return ["",
+            "   （附）你多出来的重音（不扣分）：%s" % words,
+            "        原音频这里是弱读的，别读得太重 —— 听起来像在抢话。"]
+
+
 # ---------------- 节奏分 ----------------
 # ---- 打分参数（09-28 新增）----
 # 逐块相对差 → 节奏分的汇总方式。
@@ -651,9 +878,8 @@ def main():
     mine = load_mono(MY_FILE)
     if ref is None or mine is None:
         out("")
-        out("X 没找到音频文件。请把两个 wav 放进本文件夹：")
-        out("    " + REF_FILE)
-        out("    " + MY_FILE)
+        out("X 没找到音频文件：")
+        out(missing_hint([("原音频", REF_FILE), ("模仿", MY_FILE)], SRC_DIR))
         log_done("（音频缺失，提前退出）")
         return
 
@@ -757,19 +983,27 @@ def main():
     out("")
     nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r)}
     nm = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_m)}
-    out("重音落点（按角色分组自比，跟原音频比结构，不下对错结论）：")
-    out("   原音频：" + ("、".join("#%d %s" % (i, nr[i]) for i in marked_r)
-                       or "（无）"))
-    out("   我的：  " + ("、".join("#%d %s" % (i, nm[i]) for i in marked_m)
-                       or "（无）"))
-    miss = sorted(set(marked_r) - set(marked_m))
-    extra = sorted(set(marked_m) - set(marked_r))
-    hit = sorted(set(marked_r) & set(marked_m))
-    out("   → 漏（原音频有、我没有）：" + ("、".join("#%d %s" % (i, nr[i])
-                                              for i in miss) or "无"))
-    out("   → 多（我有、原音频没有）：" + ("、".join("#%d %s" % (i, nm[i])
-                                              for i in extra) or "无"))
-    out("   → 命中：" + ("、".join("#%d %s" % (i, nr[i]) for i in hit) or "无"))
+    miss_ids = sorted(set(marked_r) - set(marked_m))
+    extra_ids = sorted(set(marked_m) - set(marked_r))
+    out("")
+    out("=" * 62)
+    out("   重音：先看两侧每块的判定依据，再看纠错结论")
+    out("=" * 62)
+    for line in render_stress_detail(detail_r, "原音频", miss=miss_ids):
+        out(line)
+    out("")
+    for line in render_stress_detail(detail_m, "我的模仿", extra=extra_ids):
+        out(line)
+    out("")
+    out("纠错结论：")
+    for line in render_stress_verdict(nr, nm, marked_r, marked_m):
+        out(line)
+    out("")
+    out("重点词清单（照这个单子练，不用自己从上面表格里找）：")
+    for line in render_focus_words(detail_r, detail_m, nr, nm):
+        out(line)
+    for line in render_extra_words(detail_r, detail_m, nr, nm):
+        out(line)
     out("")
     out("节奏分：%.1f / 100  （归一化+幂平均 p=3，见 score_blocks）" % rhythm_score)
     out("语调分：暂不出（判分标准重做中）")

@@ -402,6 +402,154 @@ check("模式判定：长音频段存在但为空 → 仍算长音频",
 
 
 # ==========================================================================
+# 8. 重音明细渲染（10-21 · 先摊开依据再下结论）
+#    锚定：以前只打印「哪几块突出」，依据全藏在 json 里，读者无法自查判定。
+# ==========================================================================
+group("8. 重音明细渲染（先依据后结论）")
+
+_d = [
+    {"序号": 1, "词": ["where", "are"], "角色": "A", "突出": True,
+     "归一值": {"音高": 3.1, "响度": 1.4, "时长": 1.2},
+     "落差σ": {"音高": 2.5, "响度": 1.8, "时长": 0.4}, "命中路": ["音高", "响度"]},
+    {"序号": 2, "词": ["oh"], "角色": "A", "突出": False,
+     "归一值": {"响度": 0.8, "时长": 0.9},       # 音高缺测（None，不给键）
+     "落差σ": {"响度": -1.1, "时长": -0.6}, "命中路": []},
+    {"序号": 3, "词": ["im"], "角色": "B", "突出": False,
+     "归一值": {"响度": 0.9}, "落差σ": {"响度": -0.9}, "命中路": []},
+]
+_lines = cr.render_stress_detail(_d, "原音频")
+_body = "\n".join(_lines)
+
+
+def _row(text):
+    """取一条明细行（不是表头/图例/统计行）：以空格 + 序号开头。"""
+    s = text.strip()
+    return s[:1].isdigit()
+
+
+_rows = [x for x in _lines if _row(x)]
+check("明细含全部 3 块（不只突出的）", len(_rows), 3)
+check("每块恰好一行", sorted(x.strip().split()[0] for x in _rows), ["1", "2", "3"])
+check("突出的块标★", any("★" in x and "where+are" in x for x in _lines), True)
+check("不突出的块标○", any("○" in x and " oh " in x for x in _lines), True)
+check("漏掉的块标 M", any("M" in x and "where+are" in x
+                          for x in cr.render_stress_detail(_d, "原音频", miss=[1])), True)
+check("多出的块标 X", any("X" in x and "oh" in x
+                          for x in cr.render_stress_detail(_d, "我的", extra=[2])), True)
+check("缺失该路数据 → 显示 - 而非崩", any("- (-" in x or x.count("-") >= 3
+                                    for x in _lines if "im" in x), True)
+check("命中路如实显示", any("音高/响度" in x for x in _lines), True)
+check("音高缺测统计提示（说明 - 不是 0）",
+      any("音高显示为 -" in x and "2/3" in x for x in _lines), True)
+check("无缺测时不加该提示",
+      any("音高显示为 -" in x for x in cr.render_stress_detail(
+          [dict(_d[0])], "原音频")), False)
+check("空明细不崩", cr.render_stress_detail([], "原音频")[0], "   （该侧没有词块）")
+# 对齐：中文按 2 格算，所有数据行的判定标记列起始位置必须一致
+def _colpos(rows):
+    pos = set()
+    for r in rows:
+        pos.add(len(r) - len(r.lstrip()))
+    return len(pos) == 1
+check("中英混排列左边界一致", _colpos(_rows), True)
+check("判定标记列对齐（★/○/M/X 同列）",
+      len({len(x.rstrip()) - len(x.rstrip().lstrip("*○MX")) for x in _rows}), 1)
+
+_v = cr.render_stress_verdict({1: "where+are", 2: "oh"}, {1: "oh", 3: "im"}, [1, 2], [3])
+check("漏项列出对侧词名", any("漏" in x and "where+are" in x for x in _v), True)
+check("多项列出（我多出来的）", any("多" in x and "im" in x for x in _v), True)
+check("空集显示「无」而非空串", any(x.strip().endswith("无") for x in
+      cr.render_stress_verdict({}, {}, [], [])), True)
+
+# ---- 重点词清单：算法直接给「哪个词 + 怎么改」 ----
+# 场景：原音频 #1 "where" 靠音高(+2.0半音)+响度突出；我这边音高只有 -0.2 → 差 2.2 半音
+_fr = [{"序号": 1, "词": ["where"], "角色": "A", "突出": True,
+        "归一值": {"音高": 2.0, "响度": 1.5, "时长": 1.1},
+        "落差σ": {"音高": 2.4, "响度": 1.6, "时长": 0.3}, "命中路": ["音高", "响度"]},
+       {"序号": 2, "词": ["thank"], "角色": "A", "突出": False,
+        "归一值": {"音高": 0.0, "响度": 0.9, "时长": 0.9},
+        "落差σ": {"音高": 0.0, "响度": -0.5, "时长": -0.4}, "命中路": []}]
+_fm = [{"序号": 1, "词": ["where"], "角色": "A", "突出": False,
+        "归一值": {"音高": -0.2, "响度": 0.8, "时长": 1.0},
+        "落差σ": {"音高": -0.5, "响度": -1.4, "时长": 0.1}, "命中路": []},
+       {"序号": 2, "词": ["thank"], "角色": "A", "突出": True,
+        "归一值": {"音高": 1.0, "响度": 1.4, "时长": 1.0},
+        "落差σ": {"音高": 1.2, "响度": 1.5, "时长": 0.2}, "命中路": ["音高", "响度"]}]
+_fw = cr.render_focus_words(_fr, _fm, {1: "where", 2: "thank"}, {1: "where", 2: "thank"})
+check("重点词清单只列漏的词（where），不列命中的（thank）",
+      any("where" in x for x in _fw) and not any("thank" in x for x in _fw), True)
+check("给出音高改法（方向+幅度档位）", any("音高" in x and "往上挑" in x for x in _fw), True)
+# ⚠️ 方向也要断言：原音频音高更高 → 建议「往上挑」。只查数字的话，
+#    把 gap 算反（my-ref）用例照样绿 —— 变异测试实测踩过这个坑。
+check("音高改法方向正确（往上挑，不是压低）",
+      any("往上挑" in x for x in _fw) and not any("压低" in x for x in _fw), True)
+check("响度改法方向正确（原声更响 → 再读响些）",
+      any("再读响些" in x for x in _fw) and not any("读轻些" in x for x in _fw), True)
+check("幅度用档位而非假精确数字", not any("半音）" in x for x in _fw), True)
+check("不输出百分比数字（避免假精确）", not any("%" in x for x in _fw), True)
+# 分档本身也要断言：轻微/明显/很大 三档各有代表值
+check("幅度分档：轻微（音高差 0.5 半音）",
+      cr._magnitude("音高", 0.5), "轻微")
+check("幅度分档：明显（音高差 2 半音）",
+      cr._magnitude("音高", 2.0), "明显")
+check("幅度分档：很大（音高差 5 半音）",
+      cr._magnitude("音高", 5.0), "很大")
+check("幅度分档：响度 10% → 轻微",
+      cr._magnitude("响度", 0.10), "轻微")
+check("幅度分档：响度 30% → 明显",
+      cr._magnitude("响度", 0.30), "明显")
+check("幅度分档：响度 80% → 很大",
+      cr._magnitude("响度", 0.80), "很大")
+check("幅度分档：负值取绝对值（方向另判）",
+      cr._magnitude("音高", -5.0), "很大")
+check("清单里带上了档位词",
+      any(("轻微" in x or "明显" in x or "很大" in x) for x in _fw), True)
+# 音高路是双向的：gap<0 时不能武断说「压低」——原声可能靠降调实现重读
+_fr3 = [dict(_fr[0])]
+_fr3[0]["归一值"] = dict(_fr[0]["归一值"], 音高=-3.0)
+_fm3 = [dict(_fm[0])]
+_fm3[0]["归一值"] = dict(_fm[0]["归一值"], 音高=2.0)
+_fw3 = cr.render_focus_words(_fr3, _fm3, {1: "where"}, {1: "where"})
+check("音高反向时不武断说「压低」",
+      not any("压低" in x for x in _fw3), True)
+check("音高反向时给出中性说明（降调重读的可能）",
+      any("反了" in x or "往哪边走" in x for x in _fw3), True)
+# 极端差值 → 判为测量异常，不给方向建议
+_fx = [dict(_fr[0])]
+_fx[0]["归一值"] = dict(_fr[0]["归一值"], 时长=4.0)   # 原侧 4 倍邻居
+_fx[0]["命中路"] = ["音高", "响度", "时长"]          # 时长在命中路里才会给建议
+_fxm = [dict(_fm[0])]
+_fxm[0]["归一值"] = dict(_fm[0]["归一值"], 时长=1.0)  # 我侧 1 倍 → 差 3 倍
+_fxm[0]["命中路"] = []
+_fxt = cr.render_focus_words(_fx, _fxm, {1: "where"}, {1: "where"})
+check("时长差 3 倍 → 判异常不给「拖长」",
+      any("反常" in x and "拖长" not in x for x in _fxt), True)
+check("响度差 5 倍 → 判异常",
+      "响度差得反常" in cr._cue_advice("响度", 5.0, 1.0), True)
+check("时长差 3 倍 → 判异常",
+      "时长差得反常" in cr._cue_advice("时长", 4.0, 1.0), True)
+check("音高差 13 半音 → 判异常",
+      "反常" in cr._cue_advice("音高", 13.0, 0.0), True)
+check("正常范围内不判异常",
+      "反常" not in cr._cue_advice("时长", 1.5, 1.0), True)
+check("带用法说明（照单子练）", any("怎么用" in x for x in _fw), True)
+check("清单有一行一个词", sum(1 for x in _fw if x.strip().startswith("·")), 1)
+# 全命中时不该列重点词：两侧突出集合完全相同
+_fr2 = [dict(_fr[0]), dict(_fr[1])]
+_fr2[0]["突出"] = True
+_fr2[1]["突出"] = True
+_fm2 = [dict(_fm[0]), dict(_fm[1])]
+_fm2[0]["突出"] = True
+_fw2 = cr.render_focus_words(_fr2, _fm2, {1: "where", 2: "thank"}, {1: "where", 2: "thank"})
+check("全命中 → 明说不用改", any("不用改" in x for x in _fw2), True)
+check("全命中 → 不列词条", sum(1 for x in _fw2 if x.strip().startswith("·")), 0)
+# 多出来的重音
+_fe = cr.render_extra_words(_fr, _fm, {1: "where", 2: "thank"}, {1: "where", 2: "thank"})
+check("多出重音被单列（不扣分但提示）", any("thank" in x and "不扣分" in x for x in _fe), True)
+check("无多出重音 → 返回空", cr.render_extra_words(_fr, _fr, {}, {}), [])
+
+
+# ==========================================================================
 # 汇总
 # ==========================================================================
 total = len(_PASS) + len(_FAIL)

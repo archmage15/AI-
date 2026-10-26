@@ -39,8 +39,8 @@ SRC_DIR = os.path.join(ROOT, "audio")
 OUT_DIR = os.path.join(ROOT, "output")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-REF_FILE = os.path.join(SRC_DIR, "原音频.wav")
-MY_FILE = os.path.join(SRC_DIR, "模仿.wav")
+REF_FILE = None      # 运行时按格式探测（见 audio_paths），可能是 .mp3 / .wav / .flac
+MY_FILE = None
 REF_PHONEME_JSON = os.path.join(SRC_DIR, "参考音素.json")
 OUT_JSON = os.path.join(OUT_DIR, "音素对比.json")
 OUT_REPORT = os.path.join(OUT_DIR, "音素对比_报告.txt")
@@ -48,6 +48,9 @@ RHYTHM_JSON = os.path.join(OUT_DIR, "节奏对比.json")   # 同单句版 schema
 
 sys.path.insert(0, HERE)
 from logkit import log, out, log_setup, log_done, log_step, log_error
+from audio_paths import find_audio_pair, missing_hint, short_name
+
+REF_FILE, MY_FILE = find_audio_pair(SRC_DIR)
 
 # 复用单句链路的函数（import 不会触发 main，有 __main__ 保护）
 import compare_phoneme as cp
@@ -247,8 +250,9 @@ def main():
     out("   还原度对比 · 长音频（按内容对齐·逐句评测）")
     out("=" * 62)
 
-    if not (os.path.exists(REF_FILE) and os.path.exists(MY_FILE)):
-        out("X 没找到音频文件：" + REF_FILE + " / " + MY_FILE)
+    if not (REF_FILE and MY_FILE):
+        out("X 没找到音频文件：")
+        out(missing_hint([("原音频", REF_FILE), ("模仿", MY_FILE)], SRC_DIR))
         log_done("（缺音频，提前退出）")
         return
 
@@ -425,6 +429,31 @@ def main():
             % (r["句号"], r["参考音素数"], r["模仿音素数"], r["匹配"], r["替换"],
                r["缺失"], r["多余"], r["文本"][:36], tag))
 
+    out("")
+    out("=" * 62)
+    out("   重音：先看两侧每块的判定依据，再看纠错结论")
+    out("=" * 62)
+    _nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r_all)}
+    _nm = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_m_all)}
+    if detail_r or detail_m:
+        for line in cr.render_stress_detail(detail_r, "原音频", miss=miss_s):
+            out(line)
+        out("")
+        for line in cr.render_stress_detail(detail_m, "我的模仿", extra=extra_s):
+            out(line)
+        out("")
+        out("纠错结论：")
+        for line in cr.render_stress_verdict(_nr, _nm, marked_r, marked_m):
+            out(line)
+        out("")
+        out("重点词清单（照这个单子练，不用自己从上面表格里找）：")
+        for line in cr.render_focus_words(detail_r, detail_m, _nr, _nm):
+            out(line)
+        for line in cr.render_extra_words(detail_r, detail_m, _nr, _nm):
+            out(line)
+    else:
+        out("   （无已读句，无重音判定）")
+
     # ---- 写 JSON（兼容单句版 schema，overall_score.py 可直接用）----
     log_step("写结果")
     align_stat = {"原生音数": total_ph + total["多余"],
@@ -531,7 +560,7 @@ def main():
     L.append("   音素对比报告（长音频·按内容对齐·逐句评测）")
     L.append("=" * 60)
     L.append("")
-    L.append("原音频.wav  vs  模仿.wav")
+    L.append("%s  vs  %s" % (short_name(REF_FILE), short_name(MY_FILE)))
     L.append("整段音素相似度：%.1f / 100" % sim)
     L.append("已模仿 %d / %d 句（漏读 %d，碎句忽略 %d）"
              % (len(scored), len(sent_results), len(missed), len(ignored)))
@@ -570,7 +599,35 @@ def main():
             L.append("   句%d：%s" % (r["句号"], r["文本"]))
     L.append("")
     L.append("-" * 60)
-    L.append("三、汇总（仅按已模仿句）")
+    L.append("三、重音：先看两侧每块的判定依据，再看纠错结论")
+    L.append("-" * 60)
+    L.append("")
+    _nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r_all)}
+    _nm = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_m_all)}
+    L.append("判定口径：三路（音高半音 / 响度÷中位 / 时长÷中位）各自按角色组归一，")
+    L.append("        每块与【同角色前后邻块】中位数比，落差 ≥ %.1fσ 且为局部极值 → 该路投突出；"
+             % cr.NEIGH_K)
+    L.append("        至少 2 路投出才算这块突出（够 2 路即取半数向上取整）。")
+    L.append("        ⚠ 音高路【双向】（升调/降调都算 prominence，因为英语重音可由降调实现）；")
+    L.append("          响度/时长路【单向】（只有「更响/更长」算突出，轻/短是弱化不是重读）。")
+    L.append("")
+    if detail_r:
+        L.extend(cr.render_stress_detail(detail_r, "原音频", miss=miss_s))
+        L.append("")
+    if detail_m:
+        L.extend(cr.render_stress_detail(detail_m, "我的模仿", extra=extra_s))
+        L.append("")
+        L.append("纠错结论：")
+        L.extend(cr.render_stress_verdict(_nr, _nm, marked_r, marked_m))
+        L.append("")
+        L.append("重点词清单（照这个单子练，不用自己从上面表格里找）：")
+        L.extend(cr.render_focus_words(detail_r, detail_m, _nr, _nm))
+        L.extend(cr.render_extra_words(detail_r, detail_m, _nr, _nm))
+    else:
+        L.append("   （无已读句，无重音判定）")
+    L.append("")
+    L.append("-" * 60)
+    L.append("四、汇总（仅按已模仿句）")
     L.append("-" * 60)
     L.append("   发音分 %.1f / 100 ｜ 音变分 %.1f / 100" % (pron, change))
     L.append("   节奏分 %.1f / 100 ｜ 重音位置 %s / 100"
