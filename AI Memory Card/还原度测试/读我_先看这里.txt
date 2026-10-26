@@ -75,6 +75,8 @@
      命令行跑：python scripts\gen_ref_phonemes.py "新句子文本"
      ※ 文本用 | 分隔两个角色，例：so Where are you Terry|oh im at the bank
      ※ 跑完自动更新 audio\参考音素.json
+     ※ 脚本会自己处理 espeak 的连读合并（词边界用 DP 对齐重建，
+       不会再出现"单词 the 的音素装的是 lesson 的音"这种错位）
 
 长音频素材（>20 秒）——只换两个音频文件就行：
 1. audio\原音频.*

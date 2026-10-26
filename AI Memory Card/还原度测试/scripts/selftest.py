@@ -550,6 +550,117 @@ check("无多出重音 → 返回空", cr.render_extra_words(_fr, _fr, {}, {}), 
 
 
 # ==========================================================================
+# 9. 词边界重建（锚定 10-26 espeak 连读合并导致区间错位）
+# ==========================================================================
+group("9. 词边界重建（锚定 10-26 连读合并 → 区间整体错位）")
+
+import gen_ref_phonemes as gp
+
+# 场景：espeak 把 "for the" 连读合并成一段 fɚðə → 段数比词数少 1。
+# 旧实现按「第 i 段 = 第 i 词」硬套 → 从 for 开始所有词的区间整体错位一格，
+# 报告里「单词 the 实读 X」指到了 lesson 的音上。
+# 这里构造最小复现：逐词音素 vs 整句音素（整句里 for+the 合并）。
+_wp = [["h", "eɪ"], ["h", "eɪ"], ["ð", "æ", "t"], ["w", "ʌ", "z"],
+       ["f", "ʌ", "n"], ["θ", "æ", "ŋ", "k", "s"],
+       ["f", "ɔː", "ɹ"], ["ð", "ə"], ["l", "ɛ", "s", "ə", "n"]]
+_sp = ["h", "eɪ", "h", "eɪ", "ð", "æ", "t", "w", "ʌ", "z", "f", "ʌ", "n",
+       "θ", "æ", "ŋ", "k", "s", "f", "ɚ", "ð", "ə", "l", "ɛ", "s", "ə", "n"]
+_rg, _cost = gp.align_words_to_phonemes(_wp, _sp)
+
+
+def _seg(i):
+    r = _rg[i]
+    return " ".join(_sp[r[0]:r[1]]) if r else ""
+
+
+check("连读合并场景：每个词都拿到区间（无一为 None）",
+      sum(1 for r in _rg if r is None), 0)
+check("连读合并场景：合并前的词不受影响", _seg(0), "h eɪ")
+check("连读合并场景：for 拿到整句里的 f ɚ", _seg(6), "f ɚ")
+check("连读合并场景：the 拿到 ð ə（不是 lesson 的音）", _seg(7), "ð ə")
+check("连读合并场景：lesson 拿到 l ɛ s ə n", _seg(8), "l ɛ s ə n")
+check("连读合并场景：DP 代价很小（≤5）", _cost <= 5, True)
+
+# 区间必须单调、不重叠
+# ⚠️ 先挡掉 None —— 区间缺失时下面会 TypeError 崩掉，
+#    崩掉看不出是哪个用例失败（变异测试时才发现，已踩）。这里显式断言。
+check("区间无 None（先判，再谈单调）", any(r is None for r in _rg), False)
+if all(r is not None for r in _rg):
+    check("区间单调递增（后一个 a ≥ 前一个 b）",
+          all(_rg[i][0] >= _rg[i - 1][1] for i in range(1, len(_rg))), True)
+else:
+    check("区间单调递增（后一个 a ≥ 前一个 b）", False, True)
+
+# 覆盖完整：所有区间并起来 = 整句音素数
+# ⚠️ 判断必须写成 `r is not None` —— 写成 `e is not None` 会在解包时就崩
+#    （None 解包成 s,e 直接 TypeError，掩盖了前面已经报出的失败）
+_cov = sum(e - s for r in _rg if r is not None for s, e in [r] if e > s)
+check("区间完整覆盖整句音素（无遗漏）", _cov, len(_sp))
+# ⚠️ 区间不能首尾颠倒（a ≤ b）—— 颠倒了下游切音素会切出空串或负长度，
+#    而且症状极难查（表现为"这个词没音"）。变异测试发现，已踩。
+check("区间首尾不颠倒（a ≤ b）",
+      all(r[0] <= r[1] for r in _rg if r is not None), True)
+_wp2 = [["h", "eɪ"], ["ð", "ə"], ["l", "ɛ", "s", "ə", "n"]]
+_sp2 = ["h", "eɪ", "ð", "ə", "l", "ɛ", "s", "ə", "n"]
+_rg2, _c2 = gp.align_words_to_phonemes(_wp2, _sp2)
+check("无合并场景：代价为 0", _c2, 0)
+# ⚠️ 同样要防 None —— 解包 None 会 TypeError 崩掉，
+#    崩掉会让「前面的失败」被掩盖，看不出真问题在哪。
+check("无合并场景：区间无 None", any(r is None for r in _rg2), False)
+check("无合并场景：词区间逐个对上",
+      [" ".join(_sp2[r[0]:r[1]]) for r in _rg2 if r is not None]
+      if all(r is not None for r in _rg2) else "<有 None 区间>",
+      ["h eɪ", "ð ə", "l ɛ s ə n"])
+
+# 空区间补齐
+_filled = gp.fill_empty_ranges([(0, 2), None, (5, 7)], 7)
+check("空区间被补成非 None", _filled[1] is not None, True)
+check("空区间落在前后邻居之间", _filled[1][0] >= 2 and _filled[1][1] <= 5, True)
+check("补齐后不越界", all(0 <= s <= e <= 7 for s, e in _filled), True)
+# ⚠️ 补齐**不能侵占邻居的音素** —— 凭空给一个词分配音素，下游会把它当成
+#    "这个词有音"，比留空更危险。补法是取空隙中点，宽度为 0。
+check("补齐后总覆盖量不变（不侵占邻居）",
+      sum(e - s for s, e in _filled), 2 + 0 + 2)
+check("补齐点落在空隙内", 2 <= _filled[1][0] <= 5, True)
+# ⚠️ 补齐点必须落在空隙**中点** —— 贴在邻居末尾会跟邻居抢同一个位置，
+#    下游按区间切音素时会切出重叠（变异测试发现，已踩）。
+check("补齐点取空隙中点", _filled[1][0], (2 + 5) // 2)
+# ⚠️ 已有宽度的区间必须**原样保留** —— 补齐只动零宽的那些。
+#    越界的区间（如 (5,2)）也要被纠正成合法值，不能原样放行。
+check("非零宽区间不被改写",
+      gp.fill_empty_ranges([(0, 2), (5, 7)], 7), [(0, 2), (5, 7)])
+check("越界区间被纠正（不原样放行）",
+      gp.fill_empty_ranges([(0, 2), (5, 2)], 7)[1][0] <= gp.fill_empty_ranges([(0, 2), (5, 2)], 7)[1][1],
+      True)
+check("全部为空时也不崩", gp.fill_empty_ranges([None, None], 4)[0][0] >= 0, True)
+
+# 契约：align 的返回值直接可用 —— 调用方不该再自己补齐
+# （补齐放在 align 内部，忘了调就会静默漏词 —— 变异测试发现，已踩）
+# 用一个「完全对不上」的词触发真正的空区间：
+#   逐词有个 "z"，整句里根本没有 → 对齐不上 → 补齐逻辑必须接手
+_rg3, _c3 = gp.align_words_to_phonemes([["a"], ["z"], ["b"]], ["a", "b"])
+check("对不上的词 → 区间仍非 None（align 内部已补齐）",
+      any(r is None for r in _rg3), False)
+# ⚠️ 断言前先挡 None —— 解包 None 会 TypeError 崩掉，掩盖前面的失败。
+#    变异测试时才发现：崩溃比失败更难查（已踩）。
+check("对不上的词 → 不越界",
+      all(0 <= s <= e <= 2 for s, e in _rg3) if all(r is not None for r in _rg3)
+      else False, True)
+check("对不上的词 → 不侵占邻居音素",
+      sum(e - s for s, e in _rg3) if all(r is not None for r in _rg3) else -1, 2)
+
+# 末位补齐也不能越界（没有后邻居可依时，只能贴住末尾）
+_edge = gp.fill_empty_ranges([(0, 2), None], 2)
+check("末位补齐不越界",
+      all(0 <= s <= e <= 2 for s, e in _edge), True)
+check("末位补齐贴住末尾", _edge[1][0] <= 2 and _edge[1][1] <= 2, True)
+
+# 空输入不崩
+check("空逐词列表 → 返回空", gp.align_words_to_phonemes([], ["a"])[0], [])
+check("空整句 → 返回零宽区间", gp.align_words_to_phonemes([["a"]], [])[0], [(0, 0)])
+
+
+# ==========================================================================
 # 汇总
 # ==========================================================================
 total = len(_PASS) + len(_FAIL)
