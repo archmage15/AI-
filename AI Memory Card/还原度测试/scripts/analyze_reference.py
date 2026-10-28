@@ -35,17 +35,9 @@ XUNFEI_CONFIG = os.path.join(ROOT, "讯飞配置.json")
 
 sys.path.insert(0, HERE)
 from logkit import log, out, log_setup, log_done, log_step, log_error
-from audio_paths import find_audio, short_name
+from audio_paths import find_reference, short_name
 import compare_phoneme as cp
 import compare_rhythm as cr
-
-
-def find_reference():
-    """定位原音频：优先 audio\原音频\原音频.*，回退 audio\原音频.*。"""
-    p = find_audio("原音频", REF_DIR)
-    if p:
-        return p
-    return find_audio("原音频", SRC_DIR)
 
 
 def run_script(name, args=()):

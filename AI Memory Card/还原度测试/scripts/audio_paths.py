@@ -46,9 +46,20 @@ def find_audio(stem, src_dir=None):
     return None
 
 
+def find_reference(src_dir=None):
+    """定位原音频：优先 audio\\原音频\\原音频.*（缓存方案后范本移进子目录），
+    回退 audio\\原音频.*（旧布局）。找不到返回 None。"""
+    base = src_dir or SRC_DIR
+    ref_dir = os.path.join(base, "原音频")
+    p = find_audio("原音频", ref_dir)
+    if p:
+        return p
+    return find_audio("原音频", base)
+
+
 def find_audio_pair(src_dir=None):
     """一次性定位 原音频 / 模仿。返回 (ref_path|None, mine_path|None)。"""
-    return find_audio("原音频", src_dir), find_audio("模仿", src_dir)
+    return find_reference(src_dir), find_audio("模仿", src_dir)
 
 
 def short_name(path):
