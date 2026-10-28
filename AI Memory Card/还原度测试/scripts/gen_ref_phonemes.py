@@ -69,6 +69,24 @@ VOCAB_JSON = os.path.join(MODEL_DIR, "vocab.json")
 
 DEFAULT_TEXT = "so Where are you working now Terry|oh im still at the bank"
 
+# ---- 生成器版本号（10-28 加）----
+# 写进 参考音素.json，run_all 用它判断「这张表是不是当前代码生成的」。
+#
+# 为什么需要（10-28 实际踩到）：
+#   run_all 原本只按时间戳判断「参考音素表比原音频新 → 跳过生成」。
+#   但**改了 gen_ref_phonemes.py 的生成逻辑**之后，旧表的时间戳照样很新
+#   → 一直跳过 → 跑出来的是**旧逻辑的结果**，而且不报错、静默地。
+#   词边界错位那个 P0 bug 修完后，副本目录就一直在用修复前的表。
+#
+# 什么时候 +1：
+#   改了任何影响「音素序列 / 词边界 / 句子边界」怎么生成的逻辑时。
+#   纯注释、纯日志改动不用 +1。
+GEN_VERSION = 2
+GEN_VERSION_NOTE = (
+    "2=10-26 修词边界错位（espeak 连读合并 → 整句+逐词+DP 对齐重建词边界）；"
+    "1=修之前（词边界错位，词级指控指错词）"
+)
+
 # espeak-ng 可执行文件的候选位置（msi 装完通常不写 PATH）
 CANDIDATES = [
     "espeak-ng",
@@ -457,7 +475,12 @@ def main():
                               "a": first_wb["a"], "b": last_wb["b"],
                               "角色": role})
 
-    payload = {"文本": text, "音素": phonemes, "词边界": word_bounds, "句子边界": sentences}
+    payload = {"文本": text, "音素": phonemes, "词边界": word_bounds,
+               "句子边界": sentences,
+               # 生成器版本号 —— run_all 靠它判断这张表是不是当前代码生成的。
+               # 没有它就会一直用旧表（改了代码但跑出旧结果，静默失效）。
+               "生成器版本": GEN_VERSION,
+               "生成器版本说明": GEN_VERSION_NOTE}
     os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)
     with open(OUT_JSON, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=1)

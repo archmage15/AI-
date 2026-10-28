@@ -72,6 +72,51 @@ def has_sentence_bounds(path):
         return False
 
 
+def ref_table_gen_version(path):
+    """读参考音素.json 里记的「生成器版本」。
+
+    读不到（旧表没有这个字段）→ 返回 None，意思是「未知版本」。
+    """
+    try:
+        import json
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("生成器版本")
+    except Exception:
+        return None
+
+
+def current_gen_version():
+    """当前生成器的版本号（从 gen_ref_phonemes.py 里读，避免两处各写一份）。"""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_gen_ref_probe", os.path.join(HERE, "gen_ref_phonemes.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)      # 只加载模块，不跑 main()
+        return getattr(mod, "GEN_VERSION", None)
+    except Exception:
+        return None
+
+
+def ref_table_is_current(path):
+    """参考音素表是不是**当前代码**生成的（版本号一致）。
+
+    为什么不能只看时间戳（10-28 实际踩到）：
+      改了 gen_ref_phonemes.py 的生成逻辑之后，旧表的时间戳照样比音频新
+      → 一直「跳过生成」→ 跑出来的是**旧逻辑的结果**，而且不报错。
+      词边界错位那个 P0 bug 修完后，副本目录就一直在用修复前的表。
+
+    规则：
+      版本号一致 → 是当前的
+      版本号不同 / 没有版本号（旧表）→ **不是当前的**，要重新生成
+    """
+    want = current_gen_version()
+    if want is None:
+        return True              # 读不到当前版本 → 不拦（别因为读不到就乱重生成）
+    return ref_table_gen_version(path) == want
+
+
 def clean_transcript(text):
     """转写文本轻量清理：修 ASR 粘连（andWhat→and What）、压多余空白。
     只做安全的字符级修补，不改内容。"""
@@ -92,12 +137,42 @@ def run_script(name, args=()):
         return 1
 
 
+def ref_table_is_usable(path, ref_audio):
+    """参考音素表能不能直接用？返回 (能用, 原因)。
+
+    判定四条，**缺一不可**：
+      1. 文件存在
+      2. 带句子边界（长音频模式必需）
+      3. 比原音频新
+      4. 生成器版本号 == 当前代码的版本号（10-28 加）
+         —— 只看时间戳不够：改了生成逻辑之后旧表照样「比音频新」，
+            会一直跳过生成，跑出旧逻辑的结果且不报错。
+
+    抽成纯函数（不碰文件系统之外的东西）才能被自检覆盖 ——
+    放在 ensure_reference 里的话，变异测试根本测不到（10-28 踩过）。
+    """
+    if not os.path.exists(path):
+        return False, "文件不存在"
+    if not has_sentence_bounds(path):
+        return False, "缺句子边界"
+    if not newer_than(path, ref_audio):
+        return False, "比原音频旧"
+    if not ref_table_is_current(path):
+        old = ref_table_gen_version(path)
+        return False, ("旧生成器版本（表里 %s / 当前 %s）"
+                       % ("缺版本号" if old is None else old, current_gen_version()))
+    return True, "就绪"
+
+
 def ensure_reference(long_mode):
     """长音频模式：确保有带句子边界的参考音素表。返回 True=就绪。"""
-    if (os.path.exists(REF_PHONEME_JSON) and has_sentence_bounds(REF_PHONEME_JSON)
-            and newer_than(REF_PHONEME_JSON, REF_WAV)):
+    _ok, _why = ref_table_is_usable(REF_PHONEME_JSON, REF_WAV)
+    if _ok:
         log("   参考音素.json 已存在且比原音频新，跳过生成", verbose=True)
         return True
+    if "旧生成器版本" in _why:
+        # 版本对不上 → 旧表作废，必须重新生成（不能静默跳过）
+        log("   参考音素.json 是**%s** → 重新生成" % _why, show=True)
 
     # 需要台词文本：优先用现成转写文本，其次讯飞自动转写
     text = None
