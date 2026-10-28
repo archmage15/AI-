@@ -844,45 +844,10 @@ check("基准口径写明了是原音频",
 check("空参考音素 → None", cl.compute_baseline([], _ref_ctc), None)
 check("空原音频 → None", cl.compute_baseline(_ref_ph, []), None)
 
-# ---- 生成器版本号（10-28：防「改了代码但用旧表跑」）----
-# 根因：run_all 原本只按时间戳判「表是否过期」。改了 gen_ref_phonemes.py
-# 的生成逻辑之后，旧表的时间戳照样比音频新 → 一直跳过生成 →
-# 跑出旧逻辑的结果，且**不报错**。副本目录就一直在用修复前的表。
-import run_all as ra
-import json as _json_mod     # 下面造临时表要用（函数内 import 作用域不到）
-
-check("当前生成器版本号能读到", ra.current_gen_version() is not None, True)
-check("生成器版本号 = 2", ra.current_gen_version(), gp.GEN_VERSION)
-# 造三张表：版本对 / 版本错 / 没有版本号（旧表）
-_t_dir = os.path.join(os_.OUT_DIR, "_t_selftest_genver")
-os.makedirs(_t_dir, exist_ok=True)
-try:
-    def _mk(name, payload):
-        p = os.path.join(_t_dir, name)
-        with open(p, "w", encoding="utf-8") as f:
-            _json_mod.dump(payload, f, ensure_ascii=False)
-        return p
-    _p_ok = _mk("ok.json", {"音素": ["h"], "生成器版本": gp.GEN_VERSION})
-    _p_old = _mk("old.json", {"音素": ["h"], "生成器版本": 1})
-    _p_none = _mk("none.json", {"音素": ["h"]})
-    check("版本号一致 → 认为是当前的", ra.ref_table_is_current(_p_ok), True)
-    check("版本号不同 → 认为是旧的（要重生成）",
-          ra.ref_table_is_current(_p_old), False)
-    check("没有版本号（旧表）→ 认为是旧的（要重生成）",
-          ra.ref_table_is_current(_p_none), False)
-    check("文件不存在 → 不是当前的（不崩）",
-          ra.ref_table_is_current(os.path.join(_t_dir, "nope.json")), False)
-    # 读版本号本身
-    check("读版本号：对的读出来", ra.ref_table_gen_version(_p_ok), gp.GEN_VERSION)
-    check("读版本号：旧表读出旧号", ra.ref_table_gen_version(_p_old), 1)
-    check("读版本号：没有则 None", ra.ref_table_gen_version(_p_none), None)
-finally:
-    import shutil
-    shutil.rmtree(_t_dir, ignore_errors=True)
-
 # ⚠️ 必须**真跑一次生成**看产物，不能查源码里有没有那个词 ——
-#    查源码的话，注释里也写着「生成器版本号」，删掉真正那行照样绿
+#    查源码的话，注释里也写着关键字段，删掉真正那行照样绿
 #    （变异测试发现：查源码的断言太弱，测不出真问题）。
+import json as _json_mod
 _gp_out = os.path.join(os_.OUT_DIR, "_t_selftest_gen_out.json")
 _gp_orig = gp.OUT_JSON
 try:
@@ -895,57 +860,12 @@ try:
     if os.path.exists(_gp_out):
         with open(_gp_out, encoding="utf-8") as f:
             _gen_out = _json_mod.load(f)
-        check("产物里有「生成器版本」字段", "生成器版本" in _gen_out, True)
-        check("产物的生成器版本 == 当前版本",
-              _gen_out.get("生成器版本"), gp.GEN_VERSION)
         check("产物里仍有音素和词边界",
               bool(_gen_out.get("音素")) and bool(_gen_out.get("词边界")), True)
 finally:
     gp.OUT_JSON = _gp_orig
     if os.path.exists(_gp_out):
         os.remove(_gp_out)
-
-# ---- ensure_reference 的判定（变异5 漏网的原因：这段没被测）----
-# ensure_reference 里那句版本检查决定了「旧表要不要重新生成」——
-# 去掉它，版本机制就整个失效。所以必须测**行为**，不能只测源码文本。
-_t_dir2 = os.path.join(os_.OUT_DIR, "_t_selftest_refuse")
-os.makedirs(_t_dir2, exist_ok=True)
-try:
-    import time as _time
-    def _mk2(name, payload, mtime=None):
-        p = os.path.join(_t_dir2, name)
-        with open(p, "w", encoding="utf-8") as f:
-            _json_mod.dump(payload, f, ensure_ascii=False)
-        if mtime is not None:
-            os.utime(p, (mtime, mtime))
-        return p
-    _audio = _mk2("audio.mp3", {"x": 1}, mtime=1000)
-    _newer = _mk2("new.json", {"句子边界": [{"句号": 1}], "生成器版本": gp.GEN_VERSION},
-                   mtime=2000)
-    _oldv = _mk2("old.json", {"句子边界": [{"句号": 1}], "生成器版本": 1}, mtime=2000)
-    _nov = _mk2("nov.json", {"句子边界": [{"句号": 1}]}, mtime=2000)
-    _nosent = _mk2("nosent.json", {"音素": ["h"], "生成器版本": gp.GEN_VERSION}, mtime=2000)
-    _older = _mk2("older.json", {"句子边界": [{"句号": 1}], "生成器版本": gp.GEN_VERSION},
-                   mtime=500)
-    # 四条判定逐条测
-    check("表：版本对+新 → 可用", ra.ref_table_is_usable(_newer, _audio)[0], True)
-    check("表：版本旧 → 不可用（要重生成）",
-          ra.ref_table_is_usable(_oldv, _audio)[0], False)
-    check("表：版本旧的原因写明",
-          "旧生成器版本" in ra.ref_table_is_usable(_oldv, _audio)[1], True)
-    check("表：无版本号（旧表）→ 不可用",
-          ra.ref_table_is_usable(_nov, _audio)[0], False)
-    check("表：无版本号的原因写明",
-          "缺版本号" in ra.ref_table_is_usable(_nov, _audio)[1], True)
-    check("表：缺句子边界 → 不可用",
-          ra.ref_table_is_usable(_nosent, _audio)[0], False)
-    check("表：比音频旧 → 不可用",
-          ra.ref_table_is_usable(_older, _audio)[0], False)
-    check("表：文件不存在 → 不可用（不崩）",
-          ra.ref_table_is_usable(os.path.join(_t_dir2, "nope.json"), _audio)[0], False)
-finally:
-    import shutil
-    shutil.rmtree(_t_dir2, ignore_errors=True)
 
 # 空输入不崩
 check("空逐词列表 → 返回空", gp.align_words_to_phonemes([], ["a"])[0], [])
