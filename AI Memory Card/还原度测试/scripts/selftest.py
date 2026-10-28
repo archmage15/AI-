@@ -655,6 +655,194 @@ check("末位补齐不越界",
       all(0 <= s <= e <= 2 for s, e in _edge), True)
 check("末位补齐贴住末尾", _edge[1][0] <= 2 and _edge[1][1] <= 2, True)
 
+
+# ==========================================================================
+# 10. 口径版本隔离 + 母语者基准 + L2 音变分类（10-28）
+# ==========================================================================
+group("10. 口径版本隔离（锚定 10-26 修词边界后新旧分数不可横比）")
+
+_V = os_.SCORE_VERSION
+# 模拟真实 history：10-21 那条是**旧口径**（修词边界 bug 之前），
+# 10-26 之后是新口径
+_hist = [
+    {"时间": "t0", "综合分": 63.2},                                    # 无模式无版本
+    {"时间": "t1", "综合分": 55.0, "模式": "单句"},                     # 无版本
+    {"时间": "t2", "综合分": 67.2, "模式": "长音频"},                   # 无版本（旧口径）
+    {"时间": "t3", "综合分": 60.6, "模式": "长音频", "口径版本": 1},     # 旧口径
+    {"时间": "t4", "综合分": 60.3, "模式": "长音频", "口径版本": _V},   # 新口径
+]
+# 关键：找新口径的记录时，不能命中旧口径的 60.6
+_prev = os_.find_prev_same_mode(_hist, "长音频", _V)
+check("新口径只跟新口径比（命中 60.3，不是旧口径的 60.6）",
+      _prev["综合分"] if _prev else None, 60.3)
+# 只传模式（不限版本）→ 仍能找到最近的（向后兼容旧调用）
+check("不传版本 → 只按模式找（向后兼容）",
+      os_.find_prev_same_mode(_hist, "长音频")["综合分"], 60.3)
+# 旧记录没有版本字段 → 视为未知版本 → 拒绝用来比
+_hist_only_old = _hist[:3]
+check("全是旧口径记录 → 拒绝出对比",
+      os_.find_prev_same_mode(_hist_only_old, "长音频", _V), None)
+check("全是旧口径记录 → 可比数 0",
+      os_.count_comparable(_hist_only_old, "长音频", _V), 0)
+check("全是旧口径记录 → 同模式数 1（t2 是长音频；t0/t1 模式不同）",
+      os_.count_comparable(_hist_only_old, "长音频"), 1)
+check("版本匹配的可比数正确",
+      os_.count_comparable(_hist, "长音频", _V), 1)
+check("append_history 会记口径版本",
+      os_.SCORE_VERSION >= 2, True)
+# ⚠️ 写入层也要测 —— 只测「查找」会漏掉「append_history 忘了写版本字段」。
+#    那样每条新记录都缺版本 → 查找永远匹配不上 → 永远无对比（静默失效）。
+#    变异测试发现的：删掉 append_history 里的版本字段，用例照样全绿。
+_hist_tmp = os_.HISTORY_JSON
+_orig_json = os_.json
+try:
+    os_.HISTORY_JSON = os_.os.path.join(os_.os.path.dirname(_hist_tmp),
+                                        "_t_selftest_history.json")
+    os_.append_history(70.0, {"发音": 70.0, "音变": 70.0, "节奏": 70.0,
+                               "重音位置": 70.0}, "长音频")
+    _w = os_.read_history()
+    check("写入的记录带口径版本", _w[-1].get("口径版本"), _V)
+    # ⚠️ 断言前先挡 None —— 解包 None 会 TypeError 崩掉，
+    #    崩掉比"断言失败"更难查：崩在前面的失败会被掩盖（已踩）。
+    _found = os_.find_prev_same_mode(_w, "长音频", _V)
+    check("写入后能按版本找回自己",
+          _found["综合分"] if _found else None, 70.0)
+finally:
+    if os_.os.path.exists(os_.HISTORY_JSON):
+        os_.os.remove(os_.HISTORY_JSON)
+    os_.HISTORY_JSON = _hist_tmp
+
+group("11. L2 音变分类（口音型 vs 没读出）")
+
+# 命中 L2 对照表 → 给出针对性提示
+check("θ→f 判为口音型并给改法",
+      "咬舌" in cp.l2_tip("θ", "f"), True)
+check("ð→d 判为口音型",
+      "咬舌" in cp.l2_tip("ð", "d"), True)
+check("ɹ→l 判为口音型",
+      "卷舌" in cp.l2_tip("ɹ", "l"), True)
+check("v→w 判为口音型",
+      "双唇" in cp.l2_tip("v", "w"), True)
+check("z→s 判为口音型",
+      "声带" in cp.l2_tip("z", "s"), True)
+check("æ→ɛ 判为口音型",
+      "下巴" in cp.l2_tip("æ", "ɛ"), True)
+# 非 L2 音变 → 不给口音提示
+check("非 L2 组合 → 不给口音提示", cp.l2_tip("k", "p"), "")
+check("相同音 → 不给口音提示", cp.l2_tip("k", "k"), "")
+# 一对多 / 多对一 → 不判定（硬套会给出错误指导）
+check("多个音对多个音 → 不判定", cp.l2_tip("θ æ", "f"), "")
+check("空实读 → 不判定", cp.l2_tip("θ", ""), "")
+# ⚠️ 多音 → 单音（实读只有一个音）**也不能套** ——
+#    否则会把"θ æ 读成了 f"说成"θ 读成了 f"，但实际丢的是 æ。
+#    变异测试发现的：去掉一对一限制后这里会硬套。
+check("多音对单音 → 不判定（不硬套）", cp.l2_tip("θ æ", "f"), "")
+check("单音对多音 → 不判定（不硬套）", cp.l2_tip("θ", "f s"), "")
+check("多音对多音 → 不判定", cp.l2_tip("θ æ", "f s"), "")
+
+# ---- 大块里的逐音配对（真实跑出来才发现的漏）----
+# difflib 把连续几个音的变化挤成一块：「θ æ」→「f ɛ」其实是两个音变。
+# 只做整块一对一 → 一个都认不出来 → 报告里"口音型"只有 2 处。
+_pairs = cp.align_l2_pairs("θ æ", "f ɛ")
+check("块内逐音配对：认出 2 个音变", len(_pairs), 2)
+check("块内逐音配对：θ→f 认出来了", _pairs[0][0:2] if _pairs else None, ("θ", "f"))
+check("块内逐音配对：æ→ɛ 认出来了", _pairs[1][0:2] if len(_pairs) > 1 else None, ("æ", "ɛ"))
+# 长度不等 → 不硬套（对不上号）
+check("块内长度不等 → 不判定", cp.align_l2_pairs("θ æ ŋ", "f ɛ"), [])
+check("块内空输入 → 空", cp.align_l2_pairs("", ""), [])
+# ⚠️ 数据要选**真不在 L2 表里**的 —— p→b 在表里（塞音清浊化），
+#    用它当"无音变"的例子会误判（已踩）。
+check("块内无音变 → 空", cp.align_l2_pairs("k t", "p b"), [])
+# ⚠️ l2_tip 内部不能越界 —— 实读为空时取 gots[0] 会 IndexError。
+#    这条断言让它变成"红色的失败"而不是"崩溃"（崩溃会掩盖前面的失败）。
+try:
+    _empty_res = cp.l2_tip("θ", "")
+    check("实读为空时不越界（不崩）", _empty_res, "")
+except Exception as e:
+    check("实读为空时不越界（不崩）", "崩了: %s" % type(e).__name__, "不崩")
+# 通用要领仍然可用
+check("通用要领仍能出（θ 有要领）", "咬舌" in cp.phoneme_tips("θ"), True)
+check("没有要领的音 → 空串", cp.phoneme_tips("xyzzy"), "")
+
+# ---- 集成层：差异条目必须带「类别」----
+# ⚠️ 只测纯函数不够 —— 变异测试发现：把 compare_long 里生成「类别」字段
+#    那行删掉，纯函数用例照样全绿（因为 l2_tip 本身没坏）。
+#    所以必须测「差异条目长什么样」。
+_sent = {"a": 0, "b": 5, "句号": 1, "文本": "that w", "_mine": [0, 1, 2, 3]}
+_text_ph = ["θ", "æ", "t", "w", "ʌ"]
+_mine = ["f", "æ", "t", "w"]              # θ 读成 f，且漏掉 ʌ
+_wb = [{"word": "that", "a": 0, "b": 3, "角色": "A"}]
+_res = cl.evaluate_sentence(_sent, _text_ph, _mine, [0, 20, 40, 60], _wb)
+_diff = _res["差异"]
+check("差异条目带类别字段", all("类别" in d for d in _diff), True)
+_kinds = set(d.get("类别") for d in _diff)
+check("类别里有「口音型」（θ→f 命中 L2 表）", "口音型" in _kinds, True)
+check("类别里有「未读出」（漏掉的音）", "未读出" in _kinds, True)
+_l2d = [d for d in _diff if d.get("类别") == "口音型"]
+check("口音型条目带针对性要领", bool(_l2d and _l2d[0].get("要领")), True)
+check("口音型条目的要领提到咬舌",
+      "咬舌" in (_l2d[0].get("要领") if _l2d else ""), True)
+_missd = [d for d in _diff if d.get("类别") == "未读出"]
+check("未读出条目的实读为空", _missd[0]["实读"] if _missd else None, "")
+check("未读出条目明说「没读出来」",
+      "没读出" in (_missd[0].get("要领") if _missd else ""), True)
+
+# ---- 分类统计函数（main 和报告都要用；作用域错位过一次）----
+# ⚠️ 之前 _cats 只在报告段算，main() 写 payload 时用不到 →
+#    UnboundLocalError，真实跑一次才炸（自检不跑 main，测不到）。
+#    抽成函数后这里能测；也顺带保证两处用的是同一份数据。
+_cats_t = cl.classify_diffs([{"句号": 1, "差异": _diff}])
+check("分类统计：口音型 1 处", len(_cats_t.get("口音型", [])), 1)
+check("分类统计：未读出 1 处", len(_cats_t.get("未读出", [])), 1)
+check("分类统计：条目带句号", _cats_t["口音型"][0][0], 1)
+check("分类统计：空输入 → 空字典",
+      cl.classify_diffs([]), {"口音型": [], "未读出": [], "多读出": [], "替换": []})
+check("分类统计：None 输入不崩", cl.classify_diffs(None)["口音型"], [])
+
+group("12. 母语者基准（让分数有参照）")
+
+# 基准必须跟本次同口径：同样用 difflib 比「原音频 vs 参考音素」
+import difflib
+_ref_ph = ["h", "eɪ", "ð", "æ", "t", "w", "ʌ", "z"]
+# 母语者只错 1 个（θ→d）；模仿错 3 个（θ→f、ʌ→æ、z→s）
+_ref_ctc = ["h", "eɪ", "d", "æ", "t", "w", "ʌ", "z"]
+_mine_ctc = ["h", "eɪ", "f", "æ", "t", "w", "æ", "s"]
+_base = difflib.SequenceMatcher(a=_ref_ph, b=_ref_ctc, autojunk=False).ratio() * 100
+_mine_sim = difflib.SequenceMatcher(a=_ref_ph, b=_mine_ctc, autojunk=False).ratio() * 100
+check("基准相似度算出（母语者错 1 个）", round(_base, 1), 87.5)
+check("模仿相似度算出（错 3 个）", round(_mine_sim, 1), 62.5)
+# 真实差距 = 基准 - 本次，而不是 100 - 本次
+check("真实差距用基准减（不是 100 减）", round(_base - _mine_sim, 1), 25.0)
+check("按满分算差距会明显更大（37.5 vs 25.0）",
+      round(100 - _mine_sim, 1), 37.5)
+check("基准差距更小 = 更接近真实（母语者也有 12.5 分的固有误差）",
+      round(_base - _mine_sim, 1) < round(100 - _mine_sim, 1), True)
+
+# ---- 基准计算函数本身（10-28 抽成独立函数才能自检）----
+# ⚠️ 之前基准算在 main() 里，变异测试测不到「基准算错」——
+#    变异后用例照样全绿（10-28 踩过）。抽成函数才能测。
+_bl = cl.compute_baseline(_ref_ph, _ref_ctc)
+check("基准函数能算出相似度", _bl["相似度"] if _bl else None, 87.5)
+check("基准函数统计替换数", _bl["替换"] if _bl else None, 1)
+check("基准函数算替换率", _bl["替换率"] if _bl else None, 12.5)
+# 关键：基准必须用「原音频」而不是「模仿」——
+#   用模仿自己的结果当基准，基准就等于本次分数，差距永远是 0（自欺欺人）。
+#   所以「正确基准」必须 ≠ 「用模仿算的假基准」。
+_bl_wrong = cl.compute_baseline(_ref_ph, _mine_ctc)
+check("用模仿当基准会得到假基准（= 本次分数，差距为 0）",
+      _bl_wrong["相似度"] if _bl_wrong else None, 62.5)
+# ⚠️ 同样先挡 None —— 变异后基准算错会返回 None，
+#    直接解包会崩，掩盖前面已经报出的失败（已踩）。
+check("正确基准 ≠ 假基准（基准确实用的是原音频）",
+      (_bl["相似度"] != _bl_wrong["相似度"])
+      if (_bl and _bl_wrong) else False, True)
+check("假基准会让真实差距变成 0（这正是要防的）",
+      round(_bl_wrong["相似度"] - _mine_sim, 1), 0.0)
+check("基准口径写明了是原音频",
+      "原音频" in (_bl.get("口径") or ""), True)
+check("空参考音素 → None", cl.compute_baseline([], _ref_ctc), None)
+check("空原音频 → None", cl.compute_baseline(_ref_ph, []), None)
+
 # 空输入不崩
 check("空逐词列表 → 返回空", gp.align_words_to_phonemes([], ["a"])[0], [])
 check("空整句 → 返回零宽区间", gp.align_words_to_phonemes([["a"]], [])[0], [(0, 0)])

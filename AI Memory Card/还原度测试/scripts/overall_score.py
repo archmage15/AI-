@@ -61,6 +61,28 @@ DIMENSIONS = [
 MODE_LONG = "长音频"
 MODE_SINGLE = "单句"
 
+# ---- 口径版本（history.json 必须记，否则跨版本比分会误导）----
+# 为什么需要它（10-28 补的欠账）：
+#   同一个「模式」下，**评分口径本身也会变**。10-26 修了「espeak 连读合并
+#   导致词边界错位」的 P0 bug —— 修之前，报告里「单词 X 实读 Y」的指控
+#   指错了词（"the" 头上装的是 lesson 的音）。修之后归因口径变了。
+#   但 10-21 那条 60.6 分是**错位口径**算出来的，跟修复后的 60.3 分
+#   直接相减，就会得出"我进步了"或"我退步了"的错误结论 ——
+#   其实只是口径变了，跟练得好不好没关系。
+#
+# 纪律同「模式」隔离：**跨口径版本一律不对比**。
+#   旧记录没有「口径版本」字段 → 视为未知版本 → 一律跳过。
+#   宁可不给对比，也不给错的对比。
+#
+# 什么时候要 +1：
+#   改了任何影响「分数怎么算」或「差异怎么归因」的东西时。
+#   纯 UI 改动、纯文案改动 → 不用 +1。
+SCORE_VERSION = 2
+SCORE_VERSION_NOTE = (
+    "2=10-26 修词边界错位（espeak 连读合并 → DP 对齐重建词边界）；"
+    "1=修之前（词边界错位，词级指控不可信）"
+)
+
 
 def detect_mode(phoneme):
     """从音素对比.json 判定本次是长音频还是单句模式。
@@ -99,30 +121,61 @@ def read_history():
         return []
 
 
-def find_prev_same_mode(hist, mode):
-    """在历史里**往回找**最近一条同模式的记录。
+def find_prev_same_mode(hist, mode, version=None):
+    """在历史里**往回找**最近一条同模式、**同口径版本**的记录。
 
     为什么不能直接用 hist[-2]（旧版做法）：
       单句（4秒）与长音频（72秒）的综合分口径不同，跨模式比会得出
       "进步了 +4.0" 的假结论 —— 分数变化其实来自素材变化，不是练得更好。
       宁可不给对比，也不给错的对比。
     旧记录没有「模式」字段 → 一律跳过（无法判断模式 = 不敢用来比）。
+
+    口径版本隔离（10-28 加）：
+      同一模式下**评分/归因口径也会变**。10-26 修了词边界错位 bug，
+      修之前的记录是「错位口径」算的分数，跟修之后的直接相减会得出
+      "我进步了"的假结论 —— 其实只是口径变了。
+      所以：版本不同 → 跳过；旧记录没有「口径版本」字段 → 也跳过
+      （不知道是哪个版本 = 不敢用来比）。
+
+    参数 version 传 None → 只按模式找（用于"能不能比"的诊断，不用于出对比）。
     """
     for entry in reversed(hist):
-        if isinstance(entry, dict) and entry.get("模式") == mode:
-            return entry
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("模式") != mode:
+            continue
+        if version is not None and entry.get("口径版本") != version:
+            continue
+        return entry
     return None
+
+
+def count_comparable(hist, mode, version=None):
+    """统计历史里有几条能用于对比（同模式 + 同口径版本）。"""
+    n = 0
+    for entry in hist:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("模式") != mode:
+            continue
+        if version is not None and entry.get("口径版本") != version:
+            continue
+        n += 1
+    return n
 
 
 def append_history(overall, parts, mode):
     """把本次综合分追加进 history.json，供报告显示「上次 vs 这次」的进步。
 
     mode 必须记（单句/长音频）—— 否则报告会把两种模式混着比。
+    口径版本也必须记 —— 否则改过评分/归因口径后，新旧分数会被直接相减，
+    得出"我进步了"的假结论（10-28 踩过：修词边界 bug 前后 60.6 vs 60.3）。
     """
     entry = {
         "时间": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "综合分": round(overall, 1),
         "模式": mode,
+        "口径版本": SCORE_VERSION,
         "分项": {k: (round(parts[k], 1) if parts.get(k) is not None else None)
                   for k, _w in DIMENSIONS},
     }
@@ -335,6 +388,7 @@ def main():
         "音素明细": stat,
         "节奏明细": rhythm,
         "音素相似度(原始)": phoneme.get("相似度"),
+        "母语者基准": (phoneme.get("长音频") or {}).get("母语者基准"),
     }
     try:
         with open(OUT_JSON, "w", encoding="utf-8") as f:
@@ -392,13 +446,28 @@ def write_report(overall, parts, phoneme, rhythm):
         L.append("   本次只按已模仿到的部分评分，未读到的部分不算错。")
         L.append("")
     L.append("综合还原度：%.1f / 100     等级：%s" % (overall, grade(overall)))
-    # 进步对比：**只跟同模式的历史记录比**。单句(≤20s) 与长音频(逐句评测)
-    # 的素材长度、评分口径都不同，跨模式比会写出"进步 +4.0"这种假结论
-    # （分数变化来自素材变化，不是练得更好）。找不到同模式记录就不显示，
-    # 并说明原因 —— 宁可不给对比，也不给错的对比。
+    # 母语者基准（10-28 加）：让分数有参照。
+    #   没有它，用户只能跟满分比 —— 60 分看着像失败，
+    #   但母语者读同一段在同一口径下也只有 88.4，真实差距是 28 分不是 40 分。
+    _bl = (phoneme.get("长音频") or {}).get("母语者基准")
+    if _bl and _bl.get("相似度") is not None:
+        _sim = phoneme.get("相似度")
+        if _sim is not None:
+            L.append("（母语者基准 %.1f 分 —— 原音频自己跟参考音素比，"
+                     "是工具的误差底线；你的真实差距 %.1f 分）"
+                     % (_bl["相似度"], max(0.0, _bl["相似度"] - _sim)))
+        else:
+            L.append("（母语者基准 %.1f 分 —— 原音频自己跟参考音素比，"
+                     "是工具的误差底线）" % _bl["相似度"])
+    # 进步对比：**只跟同模式 + 同口径版本的历史记录比**。
+    #   单句(≤20s) 与长音频(逐句评测) 的素材长度、评分口径都不同，
+    #   跨模式比会写出"进步 +4.0"这种假结论（分数变化来自素材变化）。
+    #   同理，改过归因口径后（10-26 修词边界错位）新旧分数也不能直接比。
+    #   找不到可比的记录就不显示，并说明原因 —— 宁可不给对比，也不给错的对比。
     mode = detect_mode(phoneme)
-    L.append("（本次：%s模式）" % mode)
-    prev = find_prev_same_mode(read_history(), mode)
+    L.append("（本次：%s模式 · 口径版本 %d）" % (mode, SCORE_VERSION))
+    hist = read_history()
+    prev = find_prev_same_mode(hist, mode, SCORE_VERSION)
     if prev and prev.get("综合分") is not None:
         prev_score = prev["综合分"]
         diff = round(overall, 1) - prev_score
@@ -409,9 +478,18 @@ def write_report(overall, parts, phoneme, rhythm):
         L.append("   上次%s模式 %.1f 分（%s）→ 这次 %.1f 分，%s"
                  % (mode, prev_score, prev.get("时间", "?"), overall, delta))
     else:
-        L.append("   暂无同模式（%s）的历史记录可对比 —— 已跑过 %d 次，"
-                 "其中能用于对比的是 0 次。"
-                 % (mode, len(read_history())))
+        same_mode = count_comparable(hist, mode)          # 同模式（不限版本）
+        same_ver = count_comparable(hist, mode, SCORE_VERSION)
+        if same_mode > 0 and same_ver == 0:
+            L.append("   暂无可比的历史记录 —— 已跑过 %d 次%s模式，"
+                     "但都是**旧口径版本**（评分/归因方式已改），"
+                     "直接比会得出错的结论，所以不比。"
+                     % (same_mode, mode))
+            L.append("   （下次跑就有基准了）")
+        else:
+            L.append("   暂无同模式（%s）的历史记录可对比 —— 已跑过 %d 次，"
+                     "其中能用于对比的是 %d 次。"
+                     % (mode, len(hist), same_ver))
     L.append("")
     L.append("-" * 60)
     L.append("一、分项得分（发音最重，其余持平）")
@@ -428,11 +506,42 @@ def write_report(overall, parts, phoneme, rhythm):
     L.append("二、发音 / 音变问题（哪些音不像原音频）")
     L.append("-" * 60)
     diffs = phoneme.get("差异") or []
-    if diffs:
-        for d in diffs:
-            L.append("    " + d.strip())
+    # 分类计数（10-28）：三类问题行动不同，先给总览
+    _cats = (phoneme.get("长音频") or {}).get("问题分类")
+    if _cats:
+        L.append("   口音型错误 %d 处 —— 学习者最典型的音变，优先练发音"
+                 % _cats.get("口音型", 0))
+        L.append("   未读出的音 %d 处 —— 读太轻/漏读，练清晰度"
+                 % _cats.get("未读出", 0))
+        L.append("   多读出的音 %d 处 —— 连读黏出来的，不扣分"
+                 % _cats.get("多读出", 0))
+        if _cats.get("其他替换"):
+            L.append("   其他替换 %d 处" % _cats.get("其他替换", 0))
         L.append("")
-        L.append("    ※ [替换] 属发音问题；[缺音]/[多音] 属音变（连读/弱化/吞音）")
+    if diffs:
+        # 按类别分组呈现：先给口音型（该练发音），再给其他
+        _groups = {"口音": [], "没读出": [], "多读出": [], "替换": []}
+        for d in diffs:
+            _s = d.strip()
+            for _k in _groups:
+                if _s.startswith("[%s]" % _k):
+                    _groups[_k].append(_s)
+                    break
+            else:
+                _groups["替换"].append(_s)
+        for _k, _title in (("口音", "口音型（优先练这些）"),
+                           ("没读出", "没读出来的音（练清晰度）"),
+                           ("多读出", "多读出的音（不扣分）"),
+                           ("替换", "其他替换")):
+            if not _groups[_k]:
+                continue
+            L.append("   【%s】%d 处" % (_title, len(_groups[_k])))
+            for d in _groups[_k]:
+                L.append("    " + d)
+            L.append("")
+        L.append("    ※ [口音] 是学习者典型音变（θ→f、ð→d 之类），"
+                 "母语者几乎不犯；[没读出] 是读太轻或漏读；")
+        L.append("      [多读出] 是连读黏出来的，不扣分；[替换] 是其他读错。")
     else:
         L.append("    （音素序列完全一致，很棒）")
     L.append("")
