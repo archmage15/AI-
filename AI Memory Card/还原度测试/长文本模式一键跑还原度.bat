@@ -4,17 +4,16 @@ cd /d %~dp0
 rem ============================================================
 rem  长文本模式一键跑还原度（默认：任何音频都按台词切句评测）
 rem
-rem  由 scripts\run_all.py 跑「长文本模式」：
-rem    1. 先调讯飞转写取台词文本当真值（不依赖手动放 转写文本.txt）
-rem       —— 没识别到文本 → 报「没识别到文本」直接退出
-rem    2. 按文本标点切句 → compare_long（四维度逐句评测）
+rem  由 scripts\run_all.py 跑：
+rem    1. 读原音频缓存（audio\原音频\原音频缓存.json，由「分析原音频.bat」生成）
+rem       —— 没有缓存 → 提示先跑 分析原音频.bat
+rem    2. 只对模仿音频跑音素模型 + 节奏重音，跟缓存的原音频参数比
 rem    3. overall_score 出综合报告
 rem
 rem  目录约定：
-rem    audio\      放 原音频.* / 模仿.*（mp3 / wav / flac / ogg 任意格式）
-rem    output\     结果（自动生成）
-rem    scripts\    所有 .py（run_all.py 是入口）
-rem    讯飞配置.json 必需：长文本自动转写用（app_id + secret_key）
+rem    audio\原音频\原音频.*  放范本（先跑一次 分析原音频.bat 建缓存）
+rem    audio\模仿.*          放你的跟读（每次换）
+rem    output\               结果（自动生成）
 rem ============================================================
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8

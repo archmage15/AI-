@@ -55,9 +55,10 @@ DIMENSIONS = [
 #    语调分仍从 rhythm["语调分"] 读，仅供报告显示。
 
 # ---- 评测模式（history.json 必须记，否则跨模式比分会误导）----
-# 单句 = 原音频 ≤20s；长音频 = 逐句评测。两者的素材长度、评分口径都不同，
-# 综合分**不可横向比**。混在一起比会得出"我进步了"的错误结论
-# （实测踩过：63.2 是 4 秒单句、67.2 是 72 秒长音频，被写成"↑+4.0"）。
+# 10-28 并轨后：单句 = 长文本切 1 句，所有音频统一走 compare_long，
+# 不再有独立的单句链路。所以新记录统一记 MODE_LONG。
+# 旧历史里「单句」模式的记录（compare_phoneme 旧口径）自动与新记录隔离
+# —— 模式字段不同，find_prev_same_mode 不会拿它们比。
 MODE_LONG = "长音频"
 MODE_SINGLE = "单句"
 
@@ -90,6 +91,9 @@ def detect_mode(phoneme):
     判据用 `is not None` 而非真值判断：compare_long.py 一定会写「长音频」段
     （内含 模式/句子/四个分项等 7 个键），但若哪天它写了空段，
     `phoneme.get("长音频") or None` 会把"存在但为空"误判成单句。
+
+    10-28 并轨后：所有音频都走 compare_long，所以实际上总是返回 MODE_LONG。
+    MODE_SINGLE 分支保留作兜底（万一 compare_long 没写「长音频」段）。
     """
     return MODE_LONG if phoneme.get("长音频") is not None else MODE_SINGLE
 

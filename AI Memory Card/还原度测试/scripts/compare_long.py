@@ -42,15 +42,19 @@ os.makedirs(OUT_DIR, exist_ok=True)
 REF_FILE = None      # 运行时按格式探测（见 audio_paths），可能是 .mp3 / .wav / .flac
 MY_FILE = None
 REF_PHONEME_JSON = os.path.join(SRC_DIR, "参考音素.json")
+REF_DIR = os.path.join(SRC_DIR, "原音频")
+REF_CACHE_JSON = os.path.join(REF_DIR, "原音频缓存.json")   # 原音频分析缓存（10-28 加）
 OUT_JSON = os.path.join(OUT_DIR, "音素对比.json")
 OUT_REPORT = os.path.join(OUT_DIR, "音素对比_报告.txt")
 RHYTHM_JSON = os.path.join(OUT_DIR, "节奏对比.json")   # 同单句版 schema，overall_score 直接读
 
 sys.path.insert(0, HERE)
 from logkit import log, out, log_setup, log_done, log_step, log_error
-from audio_paths import find_audio_pair, missing_hint, short_name
+from audio_paths import find_audio, missing_hint, short_name
 
-REF_FILE, MY_FILE = find_audio_pair(SRC_DIR)
+# 原音频可能放在 audio\原音频\ 子目录（10-28 拆缓存后），模仿在 audio\ 根目录
+REF_FILE = find_audio("原音频", REF_DIR) or find_audio("原音频", SRC_DIR)
+MY_FILE = find_audio("模仿", SRC_DIR)
 
 # 复用单句链路的函数（import 不会触发 main，有 __main__ 保护）
 import compare_phoneme as cp
@@ -355,6 +359,21 @@ def main():
         log_done("（缺音频，提前退出）")
         return
 
+    # ---- 读原音频缓存（10-28 加）----
+    #   原音频是固定范本，它的转写文本/参考音素表/CTC 音素/RMS/音高都不变。
+    #   有缓存就直接用，跳过原音频的模型推理 + 特征计算，只分析模仿音频。
+    ref_cache = None
+    if os.path.exists(REF_CACHE_JSON):
+        try:
+            with open(REF_CACHE_JSON, encoding="utf-8") as f:
+                ref_cache = json.load(f)
+        except Exception:
+            ref_cache = None
+    if ref_cache:
+        log("   用原音频缓存（跳过原音频的模型推理与特征计算）", show=True)
+    else:
+        log("   没找到原音频缓存 —— 请先跑 audio\\原音频\\分析原音频.bat", show=True)
+
     log_step("加载音素识别模型")
     model_path = cp.ensure_model()
     fe = cp.load_feature_extractor(model_path)
@@ -365,35 +384,55 @@ def main():
     model.eval()
     id2tok = cp.load_vocab(model_path)
 
-    log_step("识别两段音频")
     import torch
     results, frames_map = {}, {}
-    for tag, path in (("原音频", REF_FILE), ("我的模仿", MY_FILE)):
-        audio = cp.load_mono(path)
+    if ref_cache:
+        # 原音频 CTC 结果直接用缓存，只对模仿音频跑模型
+        results["原音频"] = ref_cache.get("原音频_CTC音素") or []
+        frames_map["原音频"] = ref_cache.get("原音频_帧") or []
+        log("   原音频（缓存）：%d 音素" % len(results["原音频"]))
+        log_step("识别模仿音频")
+        audio = cp.load_mono(MY_FILE)
         inputs = fe(audio, sampling_rate=cp.SR, return_tensors="pt")
         with torch.no_grad():
             logits = model(inputs.input_values).logits
         ids = torch.argmax(logits, dim=-1)[0].tolist()
         toks, frames = cp.ctc_decode(ids, id2tok)
-        results[tag] = toks
-        frames_map[tag] = frames
-        log("   %s：%d 音素（%.1f 秒）" % (tag, len(toks), len(audio) / cp.SR))
+        results["我的模仿"] = toks
+        frames_map["我的模仿"] = frames
+        log("   我的模仿：%d 音素（%.1f 秒）" % (len(toks), len(audio) / cp.SR))
+    else:
+        log_step("识别两段音频")
+        for tag, path in (("原音频", REF_FILE), ("我的模仿", MY_FILE)):
+            audio = cp.load_mono(path)
+            inputs = fe(audio, sampling_rate=cp.SR, return_tensors="pt")
+            with torch.no_grad():
+                logits = model(inputs.input_values).logits
+            ids = torch.argmax(logits, dim=-1)[0].tolist()
+            toks, frames = cp.ctc_decode(ids, id2tok)
+            results[tag] = toks
+            frames_map[tag] = frames
+            log("   %s：%d 音素（%.1f 秒）" % (tag, len(toks), len(audio) / cp.SR))
 
     ref = results["原音频"]
     mine = results["我的模仿"]
 
     log_step("读参考音素表（含句子边界）")
-    if not os.path.exists(REF_PHONEME_JSON):
-        out("X 缺少 参考音素.json —— 请先跑 gen_ref_phonemes.py 生成")
+    # 有缓存 → 参考音素表也从缓存读（自包含，不依赖 参考音素.json 文件）
+    if ref_cache and ref_cache.get("参考音素"):
+        ref_data = ref_cache["参考音素"]
+    elif os.path.exists(REF_PHONEME_JSON):
+        with open(REF_PHONEME_JSON, encoding="utf-8") as f:
+            ref_data = json.load(f)
+    else:
+        out("X 缺少 参考音素.json —— 请先跑 分析原音频.bat 或 gen_ref_phonemes.py")
         log_done("（缺参考音素表，提前退出）")
         return
-    with open(REF_PHONEME_JSON, encoding="utf-8") as f:
-        ref_data = json.load(f)
     text_ph = ref_data.get("音素") or []
     word_bounds = ref_data.get("词边界") or []
     sentences = ref_data.get("句子边界") or []
     if not sentences:
-        out("X 参考音素.json 里没有 句子边界 —— 请用新版 gen_ref_phonemes.py 重新生成")
+        out("X 参考音素表里没有 句子边界 —— 请用新版 gen_ref_phonemes.py 重新生成")
         log_done("（缺句子边界，提前退出）")
         return
     log("   参考 %d 音素 / %d 词 / %d 句" % (len(text_ph), len(word_bounds), len(sentences)))
@@ -457,9 +496,17 @@ def main():
     # ---- 节奏 / 重音（逐句两侧对称词块，整段汇总）----
     log_step("节奏 / 重音（逐句对称词块）")
     blocks_r_all, blocks_m_all, pairs = [], [], []
-    env_r = cr.frame_rms(cp.load_mono(REF_FILE))
+    # 原音频侧 RMS/音高若有缓存直接用（跳过 load_mono + 特征计算）
+    # ⚠️ 缓存里存的是 JSON 可序列化的 list，但 block_signal_features 需要
+    #    numpy 数组（env.max() / f0[bool] 布尔索引）—— 必须转回 np.array。
+    if ref_cache:
+        import numpy as np
+        env_r = np.array(ref_cache.get("原音频_RMS") or [], dtype=float)
+        f0_r = np.array(ref_cache.get("原音频_音高") or [], dtype=float)
+    else:
+        env_r = cr.frame_rms(cp.load_mono(REF_FILE))
+        f0_r = cr.pitch_contour(cp.load_mono(REF_FILE))
     env_m = cr.frame_rms(cp.load_mono(MY_FILE))
-    f0_r = cr.pitch_contour(cp.load_mono(REF_FILE))
     f0_m = cr.pitch_contour(cp.load_mono(MY_FILE))
     for s in sentences:
         r = next(x for x in sent_results if x["句号"] == s["句号"])

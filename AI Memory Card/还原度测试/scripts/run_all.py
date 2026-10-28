@@ -1,19 +1,17 @@
 # -*- coding: utf-8 -*-
-r"""一键跑还原度 · 纯硬性开关（默认长文本，--单句 走单句）
+r"""一键跑还原度 · 统一走长文本逐句评测（单句 = 长文本切 1 句）
 
 被 长文本模式一键跑还原度.bat / 单句模式一键跑还原度.bat 调用。
 
-模式判定（10-28 改：删掉「按时长自动路由」，不再拿 20 秒猜单句/长文本）：
-  默认（无参数）→ 长文本模式：
+模式（10-28 并轨：删掉独立的单句链路，单句并入长文本）：
+  所有音频统一走：
       1. 每次先调讯飞转写取台词文本当真值（不依赖手动放 转写文本.txt）
          - 转写空/失败 → 报「没识别到文本」直接退出
       2. 转写文本做轻量清理（andWhat → and What 这类粘连）后生成参考音素表
-      3. compare_long.py（四维度逐句评测）
-  --单句 / --sentence → 单句模式：compare_phoneme → compare_rhythm
-  最后都跑 overall_score.py
+      3. compare_long.py 按标点切句、逐句评测（一句文本切出 1 句，自然只跑 1 次）
+  最后跑 overall_score.py
 
-用法：python scripts\run_all.py              # 长文本（切句）
-     python scripts\run_all.py --单句        # 单句
+用法：python scripts\run_all.py
 """
 import os
 import re
@@ -32,13 +30,17 @@ SRC_DIR = os.path.join(ROOT, "audio")
 REF_PHONEME_JSON = os.path.join(SRC_DIR, "参考音素.json")
 TRANSCRIBE_TXT = os.path.join(SRC_DIR, "转写文本.txt")
 XUNFEI_CONFIG = os.path.join(ROOT, "讯飞配置.json")
+REF_DIR = os.path.join(SRC_DIR, "原音频")
+REF_CACHE_JSON = os.path.join(REF_DIR, "原音频缓存.json")   # 原音频分析缓存（10-28 加）
 
 sys.path.insert(0, HERE)
 from logkit import log, out, log_setup, log_done, log_step, log_error
-from audio_paths import find_audio_pair, missing_hint, short_name
+from audio_paths import find_audio, missing_hint, short_name
 
 # 音频格式无关：mp3 / wav / flac / ogg 都认，认不出返回 None
-REF_WAV, MY_WAV = find_audio_pair(SRC_DIR)
+# 原音频可能放在 audio\原音频\ 子目录（10-28 拆缓存后）
+REF_WAV = find_audio("原音频", REF_DIR) or find_audio("原音频", SRC_DIR)
+MY_WAV = find_audio("模仿", SRC_DIR)
 
 
 def audio_duration(path):
@@ -161,48 +163,34 @@ def ref_table_is_usable(path, ref_audio):
     return True, "就绪"
 
 
-def ensure_reference(long_mode):
-    """长文本（切句）模式：每次先调讯飞转写当真值，再生成参考音素表。
+def ensure_reference():
+    """确保参考音素表就绪（优先用原音频缓存，跳过转写+生成）。
 
-    返回 True=就绪，False=没识别到文本（调用方应直接退出）。
+    返回 True=就绪，False=没缓存且无法生成（调用方应直接退出）。
 
-    为什么每次转写、不缓存（10-28 定）：
-      这是要做成「AI 纠音程序」，不能依赖用户手动准备 转写文本.txt；
-      台词文本必须程序自己转写、自己判断。转写空 → 报「没识别到文本」退出。
+    10-28 改：原音频分析结果已缓存（audio\\原音频\\原音频缓存.json）时，
+    参考音素表/转写文本都是缓存里现成的，直接跳过讯飞转写和 espeak 生成。
+    没缓存才需要先跑「分析原音频.bat」。
     """
-    log_step("讯飞转写（取台词文本当真值）")
-    if not os.path.exists(XUNFEI_CONFIG):
-        out("")
-        out("X 没有 讯飞配置.json，无法自动转写。")
-        out("  请在项目根目录放 讯飞配置.json"
-            "（{\"app_id\":\"..\",\"secret_key\":\"..\"}），再重跑。")
-        return False
-    if run_script("xunfei_transcribe.py") != 0:
-        out("")
-        out("X 没识别到文本（转写失败或音频里没有可识别的语音）。")
-        out("  请检查：1) 音频是否正常、有人声；2) 网络与 讯飞配置.json 是否有效。")
-        return False
-    text = None
-    if os.path.exists(TRANSCRIBE_TXT):
-        with open(TRANSCRIBE_TXT, encoding="utf-8") as f:
-            text = f.read().strip()
-    if not text:
-        out("")
-        out("X 没识别到文本（转写结果为空）。")
-        return False
-
-    text = clean_transcript(text)
-    log("   台词 %d 字符，生成参考音素表（含句子边界）..." % len(text), verbose=True)
-    if run_script("gen_ref_phonemes.py", [text]) != 0:
-        out("X 生成参考音素表失败（espeak-ng 是否安装？见 gen_ref_phonemes.py 说明）")
-        return False
-    return True
+    # 有缓存 → 直接复用（参考音素表已在缓存里，无需转写/生成）
+    if os.path.exists(REF_CACHE_JSON):
+        log("   有原音频缓存 → 跳过转写与参考音素表生成", show=True)
+        return True
+    # 没缓存：看看参考音素表是否已经在（旧流程残留），在也能跑，但要提示补缓存
+    if os.path.exists(REF_PHONEME_JSON):
+        log("   没缓存但已有参考音素表，继续（建议先跑 分析原音频.bat 建缓存）", show=True)
+        return True
+    out("")
+    out("X 没找到原音频缓存，也没有参考音素表。")
+    out("  请先双击 audio\\原音频\\分析原音频.bat，把原音频分析一遍生成缓存，")
+    out("  之后一键跑还原度才会只分析模仿音频。")
+    return False
 
 
 def main():
     log_setup("一键路由")
     out("=" * 62)
-    out("   还原度测试 · 一键跑（默认长文本，--单句 走单句）")
+    out("   还原度测试 · 一键跑（统一走长文本逐句评测）")
     out("=" * 62)
 
     if not (REF_WAV and MY_WAV):
@@ -211,50 +199,23 @@ def main():
         log_done("（缺音频，提前退出）")
         return
 
-    # 纯硬性开关（10-28 改）：不再拿时长猜「单句 / 长文本」。
-    #   默认走长文本（切句）模式；--单句 / --sentence 强制单句。
-    #   理由：一句读慢也可能超过 20 秒，时长不是可靠的判据；做成纠音程序后
-    #   该由用户明确指定，而不是程序猜。
-    force_single = ("--单句" in sys.argv) or ("--sentence" in sys.argv)
-    long_mode = not force_single
-
+    # 单句 = 长文本切出恰好 1 句的特例，不再有独立的单句链路（10-28 并轨）。
+    #   所有音频统一走「讯飞转写 → 按标点切句 → compare_long 逐句评测」。
+    #   一句文本切出来就是 1 句，逐句评测循环自然只跑 1 次，无需单独分支。
     dur = audio_duration(REF_WAV) or 0.0
-    mode_name = "单句模式" if force_single else "长文本模式（切句评测）"
     out("输入音频：%s（%.1fs） vs %s" % (short_name(REF_WAV), dur, short_name(MY_WAV)))
-    out("本次模式：%s" % mode_name)
+    out("本次模式：长文本逐句评测（单句/多句统一）")
 
-    if long_mode:
-        log_step("[1/2] 长文本逐句评测（发音/音变/节奏/重音）")
-        if not ensure_reference(long_mode):
-            log_done("（没识别到文本，提前退出）")
-            return
-        if run_script("compare_long.py") != 0:
-            out("X 长文本评测失败，详见上方日志")
-            log_done("（评测失败）")
-            return
-    else:
-        log_step("[1/3] 音素对比（发音 + 音变）")
-        # 单句模式没有台词文本，不能自动重生成参考音素表 —— 但能检测「过期」：
-        # 换了新音频却没重生成 → 词标签/连读区/节奏词块全按旧句子边界算，
-        # 音素分照对但词级结果全错，且不报错（最危险的静默错误）。必须警告。
-        if (not os.path.exists(REF_PHONEME_JSON)
-                or not newer_than(REF_PHONEME_JSON, REF_WAV)):
-            out("⚠ 参考音素.json 比原音频旧（或不存在）—— 单句模式不会自动重新生成。")
-            out("   如果这段是**新句子**，请先跑：")
-            out("       python scripts\\gen_ref_phonemes.py \"新句子的文本\"")
-            out("   否则词标签 / 节奏词块会按旧句子的边界算，结果不可信。")
-            out("   （如果还是原来那句，忽略此提示。）")
-        if run_script("compare_phoneme.py") != 0:
-            out("X 音素对比失败，详见上方日志")
-            log_done("（评测失败）")
-            return
-        log_step("[2/3] 节奏 / 重音")
-        if run_script("compare_rhythm.py") != 0:
-            out("X 节奏对比失败，详见上方日志")
-            log_done("（评测失败）")
-            return
+    log_step("[1/2] 讯飞转写 + 逐句评测（发音/音变/节奏/重音）")
+    if not ensure_reference():
+        log_done("（没识别到文本，提前退出）")
+        return
+    if run_script("compare_long.py") != 0:
+        out("X 逐句评测失败，详见上方日志")
+        log_done("（评测失败）")
+        return
 
-    log_step("[%s] 综合评分 + 报告" % ("2/2" if long_mode else "3/3"))
+    log_step("[2/2] 综合评分 + 报告")
     if run_script("overall_score.py") != 0:
         out("X 综合评分失败，详见上方日志")
         log_done("（评分失败）")
@@ -265,8 +226,7 @@ def main():
     out("全部完成。结果在 output\\：")
     out("    还原度综合报告.txt   ← 先看这份（人看）")
     out("    音素对比_报告.txt    ← 逐句/逐音明细")
-    if long_mode:
-        out("    （长文本模式：逐句明细 + 漏句清单见 音素对比_报告.txt）")
+    out("    （逐句明细 + 漏句清单见 音素对比_报告.txt）")
     out("=" * 62)
     log_done("一键跑还原度")
 
