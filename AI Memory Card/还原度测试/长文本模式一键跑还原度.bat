@@ -2,20 +2,19 @@
 chcp 65001 >nul
 cd /d %~dp0
 rem ============================================================
-rem  一键跑还原度 · 自动路由版
+rem  长文本模式一键跑还原度（默认：任何音频都按台词切句评测）
 rem
-rem  由 scripts\run_all.py 统一路由：
-rem    原音频 <= 20 秒 → 单句模式：compare_phoneme → compare_rhythm
-rem    原音频 >  20 秒 → 长音频模式：自动转写/取台词文本 → 生成参考音素表
-rem                      → compare_long（四维度逐句评测）
-rem    最后都跑 overall_score 出综合报告
+rem  由 scripts\run_all.py 跑「长文本模式」：
+rem    1. 先调讯飞转写取台词文本当真值（不依赖手动放 转写文本.txt）
+rem       —— 没识别到文本 → 报「没识别到文本」直接退出
+rem    2. 按文本标点切句 → compare_long（四维度逐句评测）
+rem    3. overall_score 出综合报告
 rem
 rem  目录约定：
 rem    audio\      放 原音频.* / 模仿.*（mp3 / wav / flac / ogg 任意格式）
-rem                + 可选的 转写文本.txt
 rem    output\     结果（自动生成）
 rem    scripts\    所有 .py（run_all.py 是入口）
-rem    讯飞配置.json 可选：长音频自动转写用（app_id + secret_key）
+rem    讯飞配置.json 必需：长文本自动转写用（app_id + secret_key）
 rem ============================================================
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8

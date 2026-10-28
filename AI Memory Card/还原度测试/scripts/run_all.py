@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
-r"""一键跑还原度 · 自动路由（单句模式 / 长音频模式）
+r"""一键跑还原度 · 纯硬性开关（默认长文本，--单句 走单句）
 
-被 一键跑还原度.bat 调用，替代原来固定跑三个脚本的写法。
+被 长文本模式一键跑还原度.bat / 单句模式一键跑还原度.bat 调用。
 
-路由逻辑：
-  原音频时长 <= LONG_AUDIO_S（20s）→ 单句模式：compare_phoneme → compare_rhythm
-  原音频时长 >  LONG_AUDIO_S        → 长音频模式：
-      1. 需要参考音素表（带句子边界）。没有/过期 → 先拿台词文本：
-         - audio\转写文本.txt 存在且比原音频新 → 直接用
-         - 否则有 讯飞配置.json → 跑 xunfei_transcribe.py 自动转写
-         - 都没有 → 明确报错并告诉用户怎么办（不静默失败）
+模式判定（10-28 改：删掉「按时长自动路由」，不再拿 20 秒猜单句/长文本）：
+  默认（无参数）→ 长文本模式：
+      1. 每次先调讯飞转写取台词文本当真值（不依赖手动放 转写文本.txt）
+         - 转写空/失败 → 报「没识别到文本」直接退出
       2. 转写文本做轻量清理（andWhat → and What 这类粘连）后生成参考音素表
       3. compare_long.py（四维度逐句评测）
+  --单句 / --sentence → 单句模式：compare_phoneme → compare_rhythm
   最后都跑 overall_score.py
 
-用法：python scripts\run_all.py
+用法：python scripts\run_all.py              # 长文本（切句）
+     python scripts\run_all.py --单句        # 单句
 """
 import os
 import re
@@ -33,8 +32,6 @@ SRC_DIR = os.path.join(ROOT, "audio")
 REF_PHONEME_JSON = os.path.join(SRC_DIR, "参考音素.json")
 TRANSCRIBE_TXT = os.path.join(SRC_DIR, "转写文本.txt")
 XUNFEI_CONFIG = os.path.join(ROOT, "讯飞配置.json")
-
-LONG_AUDIO_S = 20.0        # 原音频超过此时长（秒）走长音频模式
 
 sys.path.insert(0, HERE)
 from logkit import log, out, log_setup, log_done, log_step, log_error
@@ -165,40 +162,33 @@ def ref_table_is_usable(path, ref_audio):
 
 
 def ensure_reference(long_mode):
-    """长音频模式：确保有带句子边界的参考音素表。返回 True=就绪。"""
-    _ok, _why = ref_table_is_usable(REF_PHONEME_JSON, REF_WAV)
-    if _ok:
-        log("   参考音素.json 已存在且比原音频新，跳过生成", verbose=True)
-        return True
-    if "旧生成器版本" in _why:
-        # 版本对不上 → 旧表作废，必须重新生成（不能静默跳过）
-        log("   参考音素.json 是**%s** → 重新生成" % _why, show=True)
+    """长文本（切句）模式：每次先调讯飞转写当真值，再生成参考音素表。
 
-    # 需要台词文本：优先用现成转写文本，其次讯飞自动转写
+    返回 True=就绪，False=没识别到文本（调用方应直接退出）。
+
+    为什么每次转写、不缓存（10-28 定）：
+      这是要做成「AI 纠音程序」，不能依赖用户手动准备 转写文本.txt；
+      台词文本必须程序自己转写、自己判断。转写空 → 报「没识别到文本」退出。
+    """
+    log_step("讯飞转写（取台词文本当真值）")
+    if not os.path.exists(XUNFEI_CONFIG):
+        out("")
+        out("X 没有 讯飞配置.json，无法自动转写。")
+        out("  请在项目根目录放 讯飞配置.json"
+            "（{\"app_id\":\"..\",\"secret_key\":\"..\"}），再重跑。")
+        return False
+    if run_script("xunfei_transcribe.py") != 0:
+        out("")
+        out("X 没识别到文本（转写失败或音频里没有可识别的语音）。")
+        out("  请检查：1) 音频是否正常、有人声；2) 网络与 讯飞配置.json 是否有效。")
+        return False
     text = None
-    if os.path.exists(TRANSCRIBE_TXT) and newer_than(TRANSCRIBE_TXT, REF_WAV):
+    if os.path.exists(TRANSCRIBE_TXT):
         with open(TRANSCRIBE_TXT, encoding="utf-8") as f:
             text = f.read().strip()
-        log("   用现成的 audio\\转写文本.txt（比原音频新）")
-    elif os.path.exists(XUNFEI_CONFIG):
-        log("   没有现成转写文本 → 调讯飞自动转写")
-        if run_script("xunfei_transcribe.py") != 0:
-            out("")
-            out("X 讯飞转写失败（可能没网 / 钥匙无效 / 服务未开通）。")
-            out("  两个解决办法：")
-            out("   1. 检查网络与 讯飞配置.json，修好后重跑；")
-            out("   2. 或手动把这段音频的台词文本写进 audio\\转写文本.txt 再重跑。")
-            return False
-        if os.path.exists(TRANSCRIBE_TXT):
-            with open(TRANSCRIBE_TXT, encoding="utf-8") as f:
-                text = f.read().strip()
     if not text:
         out("")
-        out("X 长音频模式需要「台词文本」才能生成参考音素表，但没找到。")
-        out("  两个解决办法（二选一）：")
-        out("   1. 自动转写：在项目根目录放 讯飞配置.json"
-            "（{\"app_id\":\"..\",\"secret_key\":\"..\"}），重跑即可；")
-        out("   2. 手动提供：把这段音频的英文台词文本存成 audio\\转写文本.txt，重跑。")
+        out("X 没识别到文本（转写结果为空）。")
         return False
 
     text = clean_transcript(text)
@@ -212,7 +202,7 @@ def ensure_reference(long_mode):
 def main():
     log_setup("一键路由")
     out("=" * 62)
-    out("   还原度测试 · 一键跑（自动路由）")
+    out("   还原度测试 · 一键跑（默认长文本，--单句 走单句）")
     out("=" * 62)
 
     if not (REF_WAV and MY_WAV):
@@ -221,19 +211,25 @@ def main():
         log_done("（缺音频，提前退出）")
         return
 
+    # 纯硬性开关（10-28 改）：不再拿时长猜「单句 / 长文本」。
+    #   默认走长文本（切句）模式；--单句 / --sentence 强制单句。
+    #   理由：一句读慢也可能超过 20 秒，时长不是可靠的判据；做成纠音程序后
+    #   该由用户明确指定，而不是程序猜。
+    force_single = ("--单句" in sys.argv) or ("--sentence" in sys.argv)
+    long_mode = not force_single
+
     dur = audio_duration(REF_WAV) or 0.0
-    long_mode = dur > LONG_AUDIO_S
+    mode_name = "单句模式" if force_single else "长文本模式（切句评测）"
     out("输入音频：%s（%.1fs） vs %s" % (short_name(REF_WAV), dur, short_name(MY_WAV)))
-    out("原音频时长 %.1f 秒 → %s" % (dur, "长音频模式（逐句评测）" if long_mode else "单句模式"))
+    out("本次模式：%s" % mode_name)
 
     if long_mode:
-        log_step("长音频模式：准备参考音素表")
+        log_step("[1/2] 长文本逐句评测（发音/音变/节奏/重音）")
         if not ensure_reference(long_mode):
-            log_done("（缺台词文本，提前退出）")
+            log_done("（没识别到文本，提前退出）")
             return
-        log_step("[1/2] 长音频逐句评测（发音/音变/节奏/重音）")
         if run_script("compare_long.py") != 0:
-            out("X 长音频评测失败，详见上方日志")
+            out("X 长文本评测失败，详见上方日志")
             log_done("（评测失败）")
             return
     else:
@@ -270,7 +266,7 @@ def main():
     out("    还原度综合报告.txt   ← 先看这份（人看）")
     out("    音素对比_报告.txt    ← 逐句/逐音明细")
     if long_mode:
-        out("    （长音频模式：逐句明细 + 漏句清单见 音素对比_报告.txt）")
+        out("    （长文本模式：逐句明细 + 漏句清单见 音素对比_报告.txt）")
     out("=" * 62)
     log_done("一键跑还原度")
 
