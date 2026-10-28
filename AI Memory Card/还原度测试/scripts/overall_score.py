@@ -411,6 +411,32 @@ def main():
     log_done("综合评分")
 
 
+def _fmt_sent_diff(d):
+    """把一句的结构化差异 dict 格式化成一行（与 compare_long 差异行口径一致）。"""
+    who = (d.get("词") or "").strip()
+    cat = d.get("类别") or "替换"
+    tip = (d.get("要领") or "").strip()
+    ref = (d.get("应读") or "").strip()
+    got = (d.get("实读") or "").strip()
+    if cat == "口音型":
+        line = "[口音] %s应读 %s：实读 %s" % (who, ref, got)
+        if tip:
+            line += "   " + tip
+        return line
+    if cat == "未读出":
+        line = "[没读出] %s应读 %s：没读出来" % (who, ref)
+        if tip:
+            line += "   " + tip
+        return line
+    if cat == "多读出":
+        return "[多读出] %s：实读 %s" % (who, got)
+    # 其他替换
+    line = "[替换] %s应读 %s：实读 %s" % (who, ref, got)
+    if tip:
+        line += "   " + tip
+    return line
+
+
 def write_report(overall, parts, phoneme, rhythm):
     L = []
     L.append("=" * 60)
@@ -518,8 +544,45 @@ def write_report(overall, parts, phoneme, rhythm):
         if _cats.get("其他替换"):
             L.append("   其他替换 %d 处" % _cats.get("其他替换", 0))
         L.append("")
-    if diffs:
-        # 按类别分组呈现：先给口音型（该练发音），再给其他
+    if mode == MODE_LONG:
+        # 长音频：按句分组，每句「原句 → 原音频音素 → 我的音素 → 该句纠音（分四类）」
+        _sentences = (phoneme.get("长音频") or {}).get("句子") or []
+        for _r in _sentences:
+            if _r.get("漏句"):
+                L.append("  · 句%d【%s】—— 漏读（不计分）"
+                         % (_r.get("句号"), _r.get("文本", "")))
+                L.append("")
+                continue
+            L.append("  句%d  %s" % (_r.get("句号"), _r.get("文本", "")))
+            if _r.get("参考音素"):
+                L.append("      原音频：%s" % _r["参考音素"])
+            if _r.get("模仿音素"):
+                L.append("      你读的：%s" % _r["模仿音素"])
+            _sdiffs = _r.get("差异") or []
+            if _sdiffs:
+                # 该句差异按四类分组
+                _sgroups = {"口音型": [], "未读出": [], "多读出": [], "替换": []}
+                for _d in _sdiffs:
+                    _c = _d.get("类别") or "替换"
+                    _sgroups.setdefault(_c, []).append(_d)
+                for _c, _title in (("口音型", "口音型"),
+                                   ("未读出", "没读出"),
+                                   ("多读出", "多读出"),
+                                   ("替换", "其他替换")):
+                    _items = _sgroups.get(_c) or []
+                    if not _items:
+                        continue
+                    L.append("      【%s】" % _title)
+                    for _d in _items:
+                        L.append("         " + _fmt_sent_diff(_d))
+            else:
+                L.append("      （本句完全一致）")
+            L.append("")
+        L.append("    ※ [口音型] 是学习者典型音变（θ→f、ð→d 之类），"
+                 "母语者几乎不犯；[没读出] 是读太轻或漏读；")
+        L.append("      [多读出] 是连读黏出来的，不扣分；[其他替换] 是普通读错。")
+    elif diffs:
+        # 单句：按类别分组呈现：先给口音型（该练发音），再给其他
         _groups = {"口音": [], "没读出": [], "多读出": [], "替换": []}
         for d in diffs:
             _s = d.strip()

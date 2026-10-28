@@ -298,6 +298,8 @@ def evaluate_sentence(sent, text_ph, mine, mine_frames, word_bounds):
         "文本": sent["文本"],
         "角色": sent.get("角色"),
         "音素区间": [sa, sb],
+        "参考音素": " ".join(sent_ref),
+        "模仿音素": " ".join(sent_mine),
         "参考音素数": len(sent_ref),
         "模仿音素数": len(sent_mine),
         "匹配": stat["匹配"], "替换": stat["替换"],
