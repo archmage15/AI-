@@ -297,6 +297,123 @@ def ctc_decode(ids, id2tok, blank=0, specials=(1, 2, 3)):
     return out, frames
 
 
+def forced_align(logits, target_phones, id2tok):
+    """强制对齐：把参考音素序列（该读什么）对齐到音频的帧级 logits。
+
+    与 difflib 序列比对不同：这是「已知要读什么，去音频里找它在哪」。
+    读快读慢不影响，因为每个参考音素在音频里找到「最像它的那一帧」即可。
+
+    ⚠️ 必须用「单调分配」，不能用「编辑距离 DP」——
+    允许"跳过参考音素"那条边时，DP 会走捷径（把 N 个参考音全跳掉、
+    随便匹配总代价更低）→ 对齐全崩、后验全是 -inf、判错率 100%。
+    正确：`best[j][t] = logp[t][id_j] + max_{t'<t} best[j-1][t']`，
+    每个参考音**必须**匹配到严格递增的帧。缺失的音表现为后验低，
+    而不是被 DP 跳过。
+
+    参数：
+      logits         [T, V] 帧级原始 logits（未 softmax，numpy 或 torch）
+      target_phones  参考音素序列 list[str]（espeak 生成的"该读的音素"）
+      id2tok         {id: 音素符号}
+
+    返回 list[dict]，逐音对齐结果：
+      {"音素", "帧", "logp", "后验"}  后验 = exp(logp)，0~1 的"像不像"分
+    """
+    if hasattr(logits, "detach"):          # torch tensor → numpy
+        logits = logits.detach().cpu().numpy()
+    if logits.ndim == 3:
+        logits = logits[0]                  # [1, T, V] → [T, V]
+    logits = np.asarray(logits, dtype=np.float32)
+    T, V = logits.shape
+    if T == 0 or not target_phones:
+        return []
+
+    # log_softmax（数值稳定）
+    logp = logits - np.max(logits, axis=1, keepdims=True)
+    logp = logp - np.log(np.sum(np.exp(logp), axis=1, keepdims=True))
+
+    # 音素 → id；词表里没有的音素跳过（正常情况不该出现，防御性处理）
+    tok2id = {v: k for k, v in id2tok.items()}
+    phone_ids = [tok2id[p] for p in target_phones if p in tok2id]
+    J = len(phone_ids)
+    if J == 0:
+        return []
+
+    # 单调分配 Viterbi：best[j][t] = logp[t][id_j] + max_{t'<t} best[j-1][t']
+    best = np.full((J, T), -np.inf, dtype=np.float32)
+    best[0] = logp[:, phone_ids[0]]
+    for j in range(1, J):
+        prefix_max = np.maximum.accumulate(best[j - 1])        # 到每帧为止的前缀最大
+        shifted = np.concatenate(([-np.inf], prefix_max[:-1]))  # t' < t（严格递增）
+        best[j] = logp[:, phone_ids[j]] + shifted
+
+    # 回溯：最后一个音素取全帧最大，往前逐个取「前一帧之前」的最大
+    frames = [0] * J
+    t = int(np.argmax(best[J - 1]))
+    frames[J - 1] = t
+    for j in range(J - 2, -1, -1):
+        t = int(np.argmax(best[j][:t]))        # 严格在前一帧之前
+        frames[j] = t
+
+    # ⚠️ 后验要用「单帧」logp[t][id_j]，不能用累计 best[j][t]——
+    #    best 是含前缀的累计值，若前一个音缺失（后验极低），会一路拉低
+    #    后面所有音的后验（踩过：b 缺失时 c/d/e 后验全变 0.000045）。
+    result = []
+    for j in range(J):
+        pid = phone_ids[j]
+        t = frames[j]
+        lp_single = float(logp[t, pid])
+        result.append({
+            "音素": id2tok.get(pid, "?"),
+            "帧": t,
+            "logp": lp_single,
+            "后验": float(np.exp(lp_single)),
+        })
+    return result
+
+
+def align_phone_verdict(aligned, target_phones, argmax_ids, id2tok,
+                        threshold=0.5):
+    """在强制对齐结果上判「可疑音」：后验低于阈值 = 这个音读得不像。
+
+    参数：
+      aligned        forced_align 的输出（逐音 帧/logp/后验）
+      target_phones  参考音素序列（与 aligned 一一对应）
+      argmax_ids     每帧的贪心 id（argmax(logits)，含 blank/special）
+      id2tok         {id: 音素符号}
+      threshold      后验低于此值判"可疑"（0~1，先取 0.5，待标定）
+
+    返回 list[dict]，可疑音：
+      {"音素", "后验", "实读", "类别"}
+      类别 ∈ {"口音型", "没读出来", "其他"}
+      「实读」= 对齐帧处贪心出来的符号（若仍等于参考音素，则只是读太轻）
+    """
+    if len(aligned) != len(target_phones):
+        return []
+    blank, specials = 0, (1, 2, 3)
+    out = []
+    for item, ref_ph in zip(aligned, target_phones):
+        post = item.get("后验", 0.0)
+        if post >= threshold:
+            continue
+        t = item.get("帧", 0)
+        got_id = int(argmax_ids[t]) if 0 <= t < len(argmax_ids) else blank
+        got = id2tok.get(got_id, "")
+        if got_id in (blank,) + tuple(specials):
+            got = ""                       # 该帧是静音/特殊符 → 没读出
+        if not got:
+            out.append({"音素": ref_ph, "后验": round(post, 3),
+                        "实读": "", "类别": "没读出来"})
+        elif got == ref_ph:
+            # 对齐帧贪心还是它自己，只是概率低 → 读太轻，不算读错
+            out.append({"音素": ref_ph, "后验": round(post, 3),
+                        "实读": got, "类别": "读太轻"})
+        else:
+            cat = "口音型" if (ref_ph, got) in L2_CONFUSIONS else "其他"
+            out.append({"音素": ref_ph, "后验": round(post, 3),
+                        "实读": got, "类别": cat})
+    return out
+
+
 def load_feature_extractor(model_path):
     try:
         from transformers import AutoFeatureExtractor

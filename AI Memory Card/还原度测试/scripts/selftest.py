@@ -930,6 +930,90 @@ check("空重音信号返回空列表", os_._render_stress_by_sentence({"重音_
 
 
 # ==========================================================================
+# 强制对齐（10-29：forced_align 单调分配 + 逐音后验判错）
+#   锚定：DP 不能用「编辑距离」（允许跳参考音素会走捷径，对齐全崩）
+#   必须用「单调分配」，每个参考音素匹配到严格递增的帧。
+# ==========================================================================
+group("强制对齐（单调分配 + 逐音后验）")
+
+import numpy as np
+# ⚠️ 词表约定与真实 wav2vec2-espeak 一致：0=blank，1/2/3=special，
+#    音素从 4 开始。测试数据若用 1/2/3 当音素 id，会被当成 special 误判
+#    （踩过：b 的实读被判成"没读出来"）。
+_fa_id2tok = {0: "<pad>", 1: "<s>", 2: "</s>", 3: "<unk>",
+              4: "a", 5: "b", 6: "c", 7: "d", 8: "e"}
+_fa_logits = np.full((15, 9), -5.0, dtype=np.float32)
+for f in range(3): _fa_logits[f, 4] = 5.0         # a: 帧 0-2
+for f in range(3, 6): _fa_logits[f, 5] = 5.0      # b: 帧 3-5
+for f in range(6, 9): _fa_logits[f, 6] = 5.0      # c: 帧 6-8
+for f in range(9, 12): _fa_logits[f, 7] = 5.0     # d: 帧 9-11
+for f in range(12, 15): _fa_logits[f, 8] = 5.0    # e: 帧 12-14
+
+_fa_target = ["a", "b", "c", "d", "e"]
+_fa_aligned = cp.forced_align(_fa_logits, _fa_target, _fa_id2tok)
+check("对齐音素数 = 参考音素数", len(_fa_aligned), 5)
+check("帧位置精确命中（a→0, b→3, c→6, d→9, e→12）",
+      [it["帧"] for it in _fa_aligned], [0, 3, 6, 9, 12])
+check("全部后验接近 1", all(it["后验"] > 0.9 for it in _fa_aligned), True)
+# 帧严格递增（单调，无跳过）
+_frames = [it["帧"] for it in _fa_aligned]
+check("帧严格递增", all(_frames[i] < _frames[i + 1] for i in range(len(_frames) - 1)), True)
+
+# 缺失音：b 缺失，后验应极低，且**不拉低其他音的后验**（踩过：用累计 best 当后验）
+_fa_miss_logits = np.full((15, 9), -5.0, dtype=np.float32)
+for f in range(3): _fa_miss_logits[f, 4] = 5.0        # a
+for f in range(3, 6): _fa_miss_logits[f, 6] = 5.0     # c（b 缺失）
+for f in range(6, 9): _fa_miss_logits[f, 7] = 5.0     # d
+for f in range(9, 12): _fa_miss_logits[f, 8] = 5.0    # e
+for f in range(12, 15): _fa_miss_logits[f, 0] = 5.0   # 空白
+_fa_aligned2 = cp.forced_align(_fa_miss_logits, _fa_target, _fa_id2tok)
+_fa_b = [it for it in _fa_aligned2 if it["音素"] == "b"][0]
+_fa_others = [it for it in _fa_aligned2 if it["音素"] != "b"]
+check("缺失的 b 后验极低", _fa_b["后验"] < 0.01, True)
+check("其他音后验不受影响（仍 >0.9）", all(it["后验"] > 0.9 for it in _fa_others), True)
+
+# 空输入不崩
+check("空参考音素 → 空列表", cp.forced_align(_fa_logits, [], _fa_id2tok), [])
+check("空 logits → 空列表",
+      cp.forced_align(np.zeros((0, 9), dtype=np.float32), _fa_target, _fa_id2tok), [])
+
+# align_phone_verdict：后验低 → 判可疑，并按实读符号分类
+_fa_argmax = _fa_miss_logits.argmax(axis=1).tolist()
+_verdict = cp.align_phone_verdict(_fa_aligned2, _fa_target, _fa_argmax, _fa_id2tok,
+                                  threshold=0.5)
+check("判出可疑音（b）", len(_verdict), 1)
+check("可疑音是 b", _verdict[0]["音素"], "b")
+check("b 类别是「其他」（实读是 a，不在 L2 表）", _verdict[0]["类别"], "其他")
+check("b 实读符号是 a", _verdict[0]["实读"], "a")
+
+# 口音型：θ→f 命中 L2 表。
+# ⚠️ 必须带上下文音素（θ+æ），否则单个 θ 会对齐到"空白帧"（那里均匀分布
+#    概率最高），而不是 f 的帧 —— 单调约束下，后面有 æ 才能把 θ 逼到 f 区域。
+_fa_th_id2tok = {0: "<pad>", 1: "<s>", 2: "</s>", 3: "<unk>",
+                 4: "θ", 5: "æ", 6: "f"}
+_fa_th_logits = np.full((9, 7), -5.0, dtype=np.float32)
+for f in range(3): _fa_th_logits[f, 6] = 5.0        # 帧 0-2 读成 f（θ 该在这）
+for f in range(3, 6): _fa_th_logits[f, 5] = 5.0     # 帧 3-5 读成 æ
+for f in range(6, 9): _fa_th_logits[f, 0] = 5.0     # 帧 6-8 空白
+_fa_th_aligned = cp.forced_align(_fa_th_logits, ["θ", "æ"], _fa_th_id2tok)
+_fa_th_verdict = cp.align_phone_verdict(_fa_th_aligned, ["θ", "æ"],
+                                        _fa_th_logits.argmax(axis=1).tolist(),
+                                        _fa_th_id2tok, threshold=0.5)
+_th_l2 = [v for v in _fa_th_verdict if v["音素"] == "θ" and v["类别"] == "口音型"]
+check("θ→f 判为口音型", len(_th_l2) == 1, True)
+check("θ 的实读是 f", _th_l2[0]["实读"] if _th_l2 else None, "f")
+
+# render_forced_align：渲染不崩，且含关键信息
+_fa_res = {"模仿": {"逐音后验": _fa_aligned2, "可疑": _verdict},
+           "原音频": {"逐音后验": _fa_aligned, "可疑": []}}
+_fa_lines = cl.render_forced_align(_fa_res)
+check("渲染非空", bool(_fa_lines), True)
+check("渲染含可疑计数", any("可疑" in ln for ln in _fa_lines), True)
+check("空输入渲染为空列表", cl.render_forced_align(None), [])
+check("无模仿侧渲染为空列表", cl.render_forced_align({"原音频": {}}), [])
+
+
+# ==========================================================================
 # 汇总
 # ==========================================================================
 total = len(_PASS) + len(_FAIL)

@@ -19,6 +19,8 @@ import os
 import subprocess
 import sys
 
+import numpy as np
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -118,6 +120,13 @@ def main():
     ids = torch.argmax(logits, dim=-1)[0].tolist()
     ref_toks, ref_frames = cp.ctc_decode(ids, id2tok)
     log("   原音频 %d 音素" % len(ref_toks))
+    # 帧级 logits 存 .npy（强制对齐用）。⚠️ 存二进制 .npy 而不是塞 JSON——
+    #   JSON 存 float 数组会膨胀 5~10 倍（约 2.6MB → 十几 MB），.npy 原样存。
+    _logits_npy = os.path.join(REF_DIR, "原音频_logits.npy")
+    _logits_arr = logits[0].detach().cpu().numpy().astype("float32")
+    np.save(_logits_npy, _logits_arr)
+    log("   原音频 logits 已存：%s（%d 帧 × %d 符号）"
+        % (os.path.basename(_logits_npy), _logits_arr.shape[0], _logits_arr.shape[1]))
 
     # ---- 4. 节奏/重音特征（RMS + 音高）----
     log_step("算节奏/重音特征（RMS + 音高）")

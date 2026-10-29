@@ -44,6 +44,7 @@ MY_FILE = None
 REF_PHONEME_JSON = os.path.join(SRC_DIR, "参考音素.json")
 REF_DIR = os.path.join(SRC_DIR, "原音频")
 REF_CACHE_JSON = os.path.join(REF_DIR, "原音频缓存.json")   # 原音频分析缓存（10-28 加）
+REF_LOGITS_NPY = os.path.join(REF_DIR, "原音频_logits.npy")  # 原音频帧级 logits（强制对齐用）
 OUT_JSON = os.path.join(OUT_DIR, "音素对比.json")
 OUT_REPORT = os.path.join(OUT_DIR, "音素对比_报告.txt")
 RHYTHM_JSON = os.path.join(OUT_DIR, "节奏对比.json")   # 同单句版 schema，overall_score 直接读
@@ -57,6 +58,7 @@ REF_FILE = find_audio("原音频", REF_DIR) or find_audio("原音频", SRC_DIR)
 MY_FILE = find_audio("模仿", SRC_DIR)
 
 # 复用单句链路的函数（import 不会触发 main，有 __main__ 保护）
+import numpy as np
 import compare_phoneme as cp
 import compare_rhythm as cr
 
@@ -388,6 +390,56 @@ def build_per_sentence_stress(block_sent_map, marked_r, marked_m, nr, nm, sent_r
     return result
 
 
+def render_forced_align(fa_result):
+    """把强制对齐对照渲染成报告文本（返回 list[str]）。
+
+    并行阶段（10-29）：与 difflib 并列展示、**不参与评分**，
+    目的是让用户看 difflib 漏了多少口音型。口径 = 拿参考音素表去音频里
+    逐音定位，每个音给「后验」（像不像的分）；后验 < 0.5 判可疑。
+    """
+    if not fa_result:
+        return []
+    mine = fa_result.get("模仿")
+    if not mine:
+        return []
+    suspicious = mine.get("可疑") or []
+    aligned = mine.get("逐音后验") or []
+    ref_side = fa_result.get("原音频")
+    ref_susp = (ref_side or {}).get("可疑") or []
+
+    L = []
+    L.append("-" * 60)
+    L.append("四、强制对齐对照（与 difflib 并列 · 仅供参考 · 不参与评分）")
+    L.append("-" * 60)
+    L.append("   口径：拿参考音素表去你的录音里逐音定位，每个音给一个「像不像」分（后验）。")
+    L.append("   后验 < 0.5 判为可疑（读得不像 / 没读出来）。读快读慢不影响。")
+    L.append("   模仿：%d 音素对齐，可疑 %d 处 ｜  原音频（母语者基准）可疑 %d 处"
+             % (len(aligned), len(suspicious), len(ref_susp)))
+    cats = {"口音型": 0, "没读出来": 0, "读太轻": 0, "其他": 0}
+    for v in suspicious:
+        c = v.get("类别") or "其他"
+        cats[c] = cats.get(c, 0) + 1
+    L.append("   其中：口音型 %d ｜ 没读出来 %d ｜ 读太轻 %d ｜ 其他 %d"
+             % (cats["口音型"], cats["没读出来"], cats["读太轻"], cats["其他"]))
+
+    l2 = [v for v in suspicious if v.get("类别") == "口音型"]
+    if l2:
+        L.append("")
+        L.append("   口音型可疑（difflib 口径可能漏掉这些，这里是逐音定位出来的）：")
+        for v in l2:
+            ref_ph, got_ph = v.get("音素"), v.get("实读")
+            tip = cp.L2_CONFUSIONS.get((ref_ph, got_ph), "")
+            line = "       · %s → %s（后验 %.2f）" % (ref_ph, got_ph, v.get("后验", 0))
+            if tip:
+                line += "   %s" % tip
+            L.append(line)
+    miss = [v for v in suspicious if v.get("类别") == "没读出来"]
+    if miss:
+        L.append("   没读出来的音（%d 个）：%s"
+                 % (len(miss), "、".join(v.get("音素", "") for v in miss)))
+    return L
+
+
 def main():
     log_setup("长音频评测")
     out("=" * 62)
@@ -427,17 +479,31 @@ def main():
 
     import torch
     results, frames_map = {}, {}
+    # 强制对齐需要帧级 logits（10-29 加）—— 之前 argmax 后就把 logits 丢了。
+    # logits_map: tag -> numpy [T, V]；argmax_map: tag -> 每帧贪心 id（判"实读"用）
+    logits_map, argmax_map = {}, {}
     if ref_cache:
         # 原音频 CTC 结果直接用缓存，只对模仿音频跑模型
         results["原音频"] = ref_cache.get("原音频_CTC音素") or []
         frames_map["原音频"] = ref_cache.get("原音频_帧") or []
         log("   原音频（缓存）：%d 音素" % len(results["原音频"]))
+        # 原音频 logits 从 .npy 缓存读（没有就跳过，强制对齐只用模仿侧也能出结果）
+        if os.path.exists(REF_LOGITS_NPY):
+            _ref_logits = np.load(REF_LOGITS_NPY)
+            logits_map["原音频"] = _ref_logits
+            argmax_map["原音频"] = _ref_logits.argmax(axis=1).tolist()
+            log("   原音频 logits（缓存）：%d 帧 × %d 符号" % _ref_logits.shape)
+        else:
+            log("   （无原音频 logits 缓存，跳过原音频强制对齐基准；跑一次 分析原音频.bat 补上）",
+                show=True)
         log_step("识别模仿音频")
         audio = cp.load_mono(MY_FILE)
         inputs = fe(audio, sampling_rate=cp.SR, return_tensors="pt")
         with torch.no_grad():
             logits = model(inputs.input_values).logits
-        ids = torch.argmax(logits, dim=-1)[0].tolist()
+        logits_map["我的模仿"] = logits[0].detach().cpu().numpy()
+        argmax_map["我的模仿"] = torch.argmax(logits, dim=-1)[0].tolist()
+        ids = argmax_map["我的模仿"]
         toks, frames = cp.ctc_decode(ids, id2tok)
         results["我的模仿"] = toks
         frames_map["我的模仿"] = frames
@@ -449,7 +515,9 @@ def main():
             inputs = fe(audio, sampling_rate=cp.SR, return_tensors="pt")
             with torch.no_grad():
                 logits = model(inputs.input_values).logits
-            ids = torch.argmax(logits, dim=-1)[0].tolist()
+            logits_map[tag] = logits[0].detach().cpu().numpy()
+            argmax_map[tag] = torch.argmax(logits, dim=-1)[0].tolist()
+            ids = argmax_map[tag]
             toks, frames = cp.ctc_decode(ids, id2tok)
             results[tag] = toks
             frames_map[tag] = frames
@@ -477,6 +545,29 @@ def main():
         log_done("（缺句子边界，提前退出）")
         return
     log("   参考 %d 音素 / %d 词 / %d 句" % (len(text_ph), len(word_bounds), len(sentences)))
+
+    # ---- 强制对齐（10-29 加，与 difflib 并行，不参与评分）----
+    #   把参考音素序列对齐到两侧音频的帧级 logits，得到逐音后验。
+    #   这是「已知要读什么，去音频里找它在哪」，不依赖词边界，也不怕读快读慢。
+    #   目的：对照 difflib 的口径，看它能不能认出 difflib 漏掉的口音型错误。
+    log_step("强制对齐（逐音后验，与 difflib 并行对照）")
+    fa_result = {"模仿": None, "原音频": None}
+    for tag, key in (("我的模仿", "模仿"), ("原音频", "原音频")):
+        if tag not in logits_map:
+            continue
+        aligned = cp.forced_align(logits_map[tag], text_ph, id2tok)
+        verdict = cp.align_phone_verdict(aligned, text_ph, argmax_map.get(tag, []),
+                                         id2tok, threshold=0.5)
+        fa_result[key] = {"逐音后验": aligned, "可疑": verdict}
+        if key == "模仿":
+            _n_susp = len(verdict)
+            _n_l2 = sum(1 for v in verdict if v["类别"] == "口音型")
+            _n_miss = sum(1 for v in verdict if v["类别"] == "没读出来")
+            log("   模仿：%d 音素对齐，可疑 %d（口音型 %d / 没读出 %d / 其他+读太轻 %d）"
+                % (len(aligned), _n_susp, _n_l2, _n_miss, _n_susp - _n_l2 - _n_miss))
+        else:
+            log("   原音频（母语者基准）：可疑 %d / %d 音素"
+                % (len(verdict), len(aligned)))
 
     # ---- 全局对齐（按内容，不用时间戳）----
     log_step("全局对齐（按内容）")
@@ -541,7 +632,6 @@ def main():
     # ⚠️ 缓存里存的是 JSON 可序列化的 list，但 block_signal_features 需要
     #    numpy 数组（env.max() / f0[bool] 布尔索引）—— 必须转回 np.array。
     if ref_cache:
-        import numpy as np
         env_r = np.array(ref_cache.get("原音频_RMS") or [], dtype=float)
         f0_r = np.array(ref_cache.get("原音频_音高") or [], dtype=float)
     else:
@@ -736,6 +826,10 @@ def main():
                    # 有了它，报告里的分数才有参照 —— 否则用户只能跟满分比，
                    # 以为差 40 分，实际母语者读同一段也差这个数。
                    "母语者基准": baseline},
+        # 强制对齐对照（10-29 加，与 difflib 并行，不参与评分）：
+        #   逐音后验 + 可疑音清单。目的：让用户看 difflib 漏了多少口音型。
+        #   fa_result["模仿"] / ["原音频"] 各含 逐音后验 / 可疑。
+        "强制对齐": fa_result,
         "参考音素可用": True,
     }
     with open(OUT_JSON, "w", encoding="utf-8") as f:
@@ -868,16 +962,18 @@ def main():
         if len(_cats["口音型"]) > 30:
             L.append("   （还有 %d 处，见上方逐句明细）"
                      % (len(_cats["口音型"]) - 30))
+    # 强制对齐对照（10-29 加，并行不参与评分）
+    L.extend(render_forced_align(fa_result))
     if missed:
         L.append("")
         L.append("-" * 60)
-        L.append("四、漏句清单（未读到的句子，不扣分）")
+        L.append("五、漏句清单（未读到的句子，不扣分）")
         L.append("-" * 60)
         for r in missed:
             L.append("   句%d：%s" % (r["句号"], r["文本"]))
     L.append("")
     L.append("-" * 60)
-    L.append("五、重音：先看两侧每块的判定依据，再看纠错结论")
+    L.append("六、重音：先看两侧每块的判定依据，再看纠错结论")
     L.append("-" * 60)
     L.append("")
     _nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r_all)}
@@ -905,7 +1001,7 @@ def main():
         L.append("   （无已读句，无重音判定）")
     L.append("")
     L.append("-" * 60)
-    L.append("四、汇总（仅按已模仿句）")
+    L.append("七、汇总（仅按已模仿句）")
     L.append("-" * 60)
     L.append("   发音分 %.1f / 100 ｜ 音变分 %.1f / 100" % (pron, change))
     L.append("   节奏分 %.1f / 100 ｜ 重音位置 %s / 100"
