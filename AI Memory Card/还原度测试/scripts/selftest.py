@@ -873,6 +873,63 @@ check("空整句 → 返回零宽区间", gp.align_words_to_phonemes([["a"]], []
 
 
 # ==========================================================================
+# 按句重音聚合 + 报告渲染（10-28：重音位置从「只报漏了啥」改成「逐句三行」）
+# ==========================================================================
+group("按句重音聚合与逐句渲染")
+
+# build_per_sentence_stress 的输入：块序号->句号、两侧突出块、块名映射、句子结果
+_sent_res = [
+    {"句号": 1, "文本": "hey that was fun", "漏句": False, "忽略": False},
+    {"句号": 2, "文本": "Thanks for the lesson", "漏句": False, "忽略": False},
+    {"句号": 3, "文本": "Really", "漏句": False, "忽略": False},
+]
+# 句1 块1-4，句2 块5-8，句3 块9
+_bmap = {1: 1, 2: 1, 3: 1, 4: 1, 5: 2, 6: 2, 7: 2, 8: 2, 9: 3}
+_nr = {1: "hey", 2: "that", 3: "was", 4: "fun", 5: "Thanks", 6: "for",
+       7: "the", 8: "lesson", 9: "Really"}
+_nm = dict(_nr)
+# 原音频突出 fun(4)、lesson(8)；我突出 fun(4)、Thanks(5)
+_mr = [4, 8]
+_mm = [4, 5]
+_per = cl.build_per_sentence_stress(_bmap, _mr, _mm, _nr, _nm, _sent_res)
+check("每句都返回（含无重音句）", len(_per), 3)
+_s1 = _per[0]
+check("句1 应读重音", _s1["应读重音"], ["fun"])
+check("句1 实读重音", _s1["实读重音"], ["fun"])
+check("句1 漏读重音（空）", _s1["漏读重音"], [])
+check("句1 多读重音（空）", _s1["多读重音"], [])
+_s2 = _per[1]
+check("句2 漏读 lesson", _s2["漏读重音"], ["lesson"])
+check("句2 多读 Thanks", _s2["多读重音"], ["Thanks"])
+check("句2 应读重音（原突出的是 lesson，Thanks 是我多读的）", _s2["应读重音"], ["lesson"])
+_s3 = _per[2]
+check("句3 无重音句也应返回", _s3["应读重音"], [])
+check("句3 实读重音空", _s3["实读重音"], [])
+
+# _mark_stressed_words：把重读词用【】框进原句，不区分大小写、按词边界
+check("框词（大小写不敏感）",
+      os_._mark_stressed_words("Thanks for the lesson", ["thanks", "lesson"]),
+      "【Thanks】 for the 【lesson】")
+check("框词不命中则原样",
+      os_._mark_stressed_words("hey that was fun", ["nope"]),
+      "hey that was fun")
+check("空重音列表返回原句",
+      os_._mark_stressed_words("Really", []), "Really")
+
+# _render_stress_by_sentence：三行结构（应读/实读/纠音）
+_rh = {"重音_信号": {"按句重音": _per}}
+_rlines = os_._render_stress_by_sentence(_rh)
+check("渲染非空", bool(_rlines), True)
+check("包含应读行", any("应读重音" in ln for ln in _rlines), True)
+check("包含实读行", any("你读的重音" in ln for ln in _rlines), True)
+check("句2 纠音含「漏了」", any("漏了" in ln and "lesson" in ln for ln in _rlines), True)
+check("句2 纠音含「多了」", any("多了" in ln and "Thanks" in ln for ln in _rlines), True)
+# 无按句数据（旧 JSON / 单句）→ 返回空列表，报告不崩
+check("无按句数据返回空列表", os_._render_stress_by_sentence({}), [])
+check("空重音信号返回空列表", os_._render_stress_by_sentence({"重音_信号": {}}), [])
+
+
+# ==========================================================================
 # 汇总
 # ==========================================================================
 total = len(_PASS) + len(_FAIL)

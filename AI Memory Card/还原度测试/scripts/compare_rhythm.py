@@ -297,12 +297,15 @@ def block_signal_features(env, f0, blocks):
 
 
 def mark_stress_neighborhood(feats, blocks, R=NEIGH_R, K=NEIGH_K, roles=None):
-    """邻域法重音判定（§2.1）+ 角色分组叠加（§5.5）。
+    """邻域法重音判定（§2.1）。
 
-    三路：音高(半音归一消性别) / 响度(÷中位) / 时长(÷中位)，各自**按角色组**归一。
-    每块对【同角色】前后邻块（半径 R）的中位数取差；局部最大且落差≥K·σ → 该路投突出。
-    同角色邻居不足时退回该组面板（用组均值当邻居中位数）。
+    三路：音高(半音归一消性别) / 响度(÷中位) / 时长(÷中位)，各自**整段归一**。
+    每块对前后邻块（半径 R）的中位数取差；局部最大且落差≥K·σ → 该路投突出。
+    邻居不足时退回整段面板（用组均值当邻居中位数）。
     某路在该块为 None → 弃权。need = max(2, ceil(可用路数/2)) 路投才算突出。
+
+    注：`roles` 参数已废弃（10-28 大法师拍板不分角色），保留仅为兼容旧调用，
+    内部一律按整段归一，不再分组。
 
     ⚠️ 删了旧 `detrend_linear`：邻域法自带局部性，去趋势反而抹掉句尾弱化信号。
     ⚠️ 时长与「节奏分」共用时长信号 → 风险 21「重复扣分」由大法师 09-23 拍板「照旧接受」。
@@ -311,9 +314,8 @@ def mark_stress_neighborhood(feats, blocks, R=NEIGH_R, K=NEIGH_K, roles=None):
     n = len(feats)
     if roles is None:
         roles = [None] * n
-    groups = {}
-    for i, r in enumerate(roles):
-        groups.setdefault(r, []).append(i)
+    # 整段一个组（不分角色）
+    groups = {None: list(range(n))}
 
     def normed(idxs, cue):
         """返回 {i: 归一值}, sigma。原始值 None/<=0 的弃掉。"""
@@ -332,24 +334,22 @@ def mark_stress_neighborhood(feats, blocks, R=NEIGH_R, K=NEIGH_K, roles=None):
         sigma = float(np.std(list(out.values()))) if len(out) > 1 else 0.0
         return out, sigma
 
-    # 三路归一值，按角色组
-    cue_of = {}     # role -> {cue: ({i:val}, sigma)}
-    for r, idxs in groups.items():
-        cue_of[r] = {"音高": normed(idxs, "音高"),
-                     "响度": normed(idxs, "响度"),
-                     "时长": normed(idxs, "时长")}
+    # 三路归一值，整段一组
+    cue_of = {None: {"音高": normed(groups[None], "音高"),
+                     "响度": normed(groups[None], "响度"),
+                     "时长": normed(groups[None], "时长")}}
 
     marked, detail = [], []
     for i in range(n):
-        r = roles[i]
-        same = groups.get(r, [])
+        r = None
+        same = groups[None]
         pos = same.index(i) if i in same else -1
-        # 同角色半径 R 内的邻居（不含自己）
+        # 半径 R 内的邻居（不含自己）
         nbrs = [same[j] for j in range(max(0, pos - R), min(len(same), pos + R + 1))
                 if pos >= 0 and same[j] != i] if pos >= 0 else []
 
         votes, block_norm = [], {}
-        for cue, (nm, sigma) in cue_of.get(r, {}).items():
+        for cue, (nm, sigma) in cue_of.get(None, {}).items():
             if i not in nm or sigma <= 0:
                 continue
             my_val = nm[i]

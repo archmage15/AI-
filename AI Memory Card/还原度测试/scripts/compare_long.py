@@ -347,6 +347,47 @@ def build_sentence_blocks(sent, text_ph, ref, ref_frames, mine, mine_frames, wor
     return side("ref", ref, ref_frames), side("mine", mine, mine_frames)
 
 
+def build_per_sentence_stress(block_sent_map, marked_r, marked_m, nr, nm, sent_results):
+    """把整段的重音判定按句聚合，供报告逐句展示「应读哪些重音 / 我读了哪些」。
+
+    输入：
+      block_sent_map  {块序号 -> 句号}
+      marked_r/marked_m  原音频/模仿判定为突出的块序号集合
+      nr/nm  {块序号 -> 词}（如 {5: "fun", ...}）
+      sent_results  compare_long 的逐句结果（含 句号/文本/漏句/忽略）
+
+    返回：list[dict]，每句一个元素，只含「有重音可说的」句（应读或实读有突出块的）：
+      {"句号", "文本", "应读重音": [词...], "实读重音": [词...],
+       "漏读重音": [词...], "多读重音": [词...]}
+
+    「应读重音」= 该句内原音频突出的块；「实读重音」= 该句内我突出的块。
+    「漏读重音」= 应读但我没突出（漏）；「多读重音」= 我突出但原音频没突出（多）。
+    """
+    marked_r, marked_m = set(marked_r), set(marked_m)
+    # 句号 -> 该句的块序号（按全局序号升序，保证词序）
+    blocks_by_sent = {}
+    for no, sid in block_sent_map.items():
+        blocks_by_sent.setdefault(sid, []).append(no)
+    for v in blocks_by_sent.values():
+        v.sort()
+
+    # 句号 -> 文本（供报告直接引用，不用再回 overall_score 找）
+    text_by_sent = {r["句号"]: r.get("文本", "") for r in sent_results}
+
+    result = []
+    for sid in sorted(blocks_by_sent, key=lambda x: (x is None, x)):
+        nos = blocks_by_sent[sid]
+        should = [nr.get(n, "?") for n in nos if n in marked_r]
+        got = [nm.get(n, "?") for n in nos if n in marked_m]
+        missed = [nr.get(n, "?") for n in nos if n in marked_r and n not in marked_m]
+        extra = [nm.get(n, "?") for n in nos if n in marked_m and n not in marked_r]
+        # 每句都返回（含无重音的句），让报告能逐句完整标注「该读/实读」。
+        result.append({"句号": sid, "文本": text_by_sent.get(sid, ""),
+                       "应读重音": should, "实读重音": got,
+                       "漏读重音": missed, "多读重音": extra})
+    return result
+
+
 def main():
     log_setup("长音频评测")
     out("=" * 62)
@@ -508,6 +549,10 @@ def main():
         f0_r = cr.pitch_contour(cp.load_mono(REF_FILE))
     env_m = cr.frame_rms(cp.load_mono(MY_FILE))
     f0_m = cr.pitch_contour(cp.load_mono(MY_FILE))
+    # 块序号 -> 句号 映射：重音判定是整段算的（序号全局 1..N），
+    # 但报告要按句展示「应读哪些重音 / 我读了哪些」，
+    # 所以 extend 词块时同步记下每个块属于哪一句。
+    block_sent_map = {}
     for s in sentences:
         r = next(x for x in sent_results if x["句号"] == s["句号"])
         if r["漏句"] or r["忽略"]:
@@ -516,8 +561,12 @@ def main():
                                        mine, frames_map["我的模仿"], word_bounds)
         if not br or not bm:
             continue
+        # 本句块在本句内的下标从 0 开始；全局序号 = 已 extend 的块数 + 下标 + 1
+        base = len(blocks_r_all)
         blocks_r_all.extend(br)
         blocks_m_all.extend(bm)
+        for k in range(len(br)):
+            block_sent_map[base + k + 1] = s["句号"]
         for i in range(min(len(br), len(bm))):
             pairs.append({"序号": len(pairs) + 1,
                           "块": "+".join(br[i]["词"]),
@@ -527,20 +576,18 @@ def main():
                           "我的时长": cr.block_span(bm[i])})
     # 节奏分：把所有已读句的词块对合成一次 score_blocks（归一化+幂平均，同单句口径）
     items, rhythm_score = cr.score_blocks(pairs) if pairs else ([], 0.0)
-    # 重音：两侧各自邻域法（整段已读部分当一个整体，同单句口径），再比对集合
+    # 重音：两侧各自邻域法（整段已读部分当一个整体，不分角色，同单句口径），再比对集合
     feats_r = cr.block_signal_features(env_r, f0_r, blocks_r_all)
     feats_m = cr.block_signal_features(env_m, f0_m, blocks_m_all)
     for i, b in enumerate(blocks_r_all):
         feats_r[i]["词"] = b["词"]
     for i, b in enumerate(blocks_m_all):
         feats_m[i]["词"] = b["词"]
-    roles_r = [b.get("角色") for b in blocks_r_all]
-    roles_m = [b.get("角色") for b in blocks_m_all]
     marked_r, detail_r = (cr.mark_stress_neighborhood(feats_r, blocks_r_all, cr.NEIGH_R,
-                                                      cr.NEIGH_K, roles_r)
+                                                      cr.NEIGH_K)
                           if blocks_r_all else ([], []))
     marked_m, detail_m = (cr.mark_stress_neighborhood(feats_m, blocks_m_all, cr.NEIGH_R,
-                                                      cr.NEIGH_K, roles_m)
+                                                      cr.NEIGH_K)
                           if blocks_m_all else ([], []))
     miss_s = sorted(set(marked_r) - set(marked_m))
     extra_s = sorted(set(marked_m) - set(marked_r))
@@ -729,6 +776,9 @@ def main():
             "多（我的）": [{"序号": i, "块": nm.get(i, "?")} for i in extra_s],
             "命中": [{"序号": i, "块": nr.get(i, "?")} for i in hit_s],
             "逐块明细": {"原音频": detail_r, "我的": detail_m},
+            "块序号到句号": block_sent_map,
+            "按句重音": build_per_sentence_stress(
+                block_sent_map, marked_r, marked_m, nr, nm, sent_results),
             "说明": "长音频模式：已读部分当一个整体做邻域统计（同单句口径）",
         },
         "词表": {"原音频": [{"词": b["词"], "start_ms": b["start_ms"], "end_ms": b["end_ms"],

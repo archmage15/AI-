@@ -441,6 +441,74 @@ def _fmt_sent_diff(d):
     return line
 
 
+def _mark_stressed_words(text, stressed, marker="【】"):
+    """在句子里把「重读的词」用标记框出来。
+
+    text 是原句文本，stressed 是应框的词列表（与重音块的「词」对应）。
+    逐个词查找（不区分大小写、按词边界），命中则替换为该词的【】框住版本。
+    找不到的词原样保留在 stressed 里不影响其它词。
+    """
+    if not stressed:
+        return text
+    words = text.split()
+    hit = set(s.lower() for s in stressed)
+    marked = []
+    for w in words:
+        key = w.strip(".,!?;:'\"")
+        if key.lower() in hit:
+            marked.append(marker[0] + key + marker[1])
+        else:
+            marked.append(w)
+    return " ".join(marked)
+
+
+def _render_stress_by_sentence(rhythm):
+    """把按句重音渲染成「每句三行」结构，返回 list[str]。
+
+    每句：
+      ① 应读：原句，把「应该读出的重音词」用【】框出
+      ② 实读：原句，把「我实际读出的重音词」用【】框出
+      ③ 纠音：一句话点出漏了哪些、多了哪些
+    无按句数据（单句模式或旧 JSON）→ 返回空列表。
+    """
+    st = (rhythm or {}).get("重音_信号") or {}
+    per_sent = st.get("按句重音") or []
+    if not per_sent:
+        return []
+    L = []
+    for s in per_sent:
+        text = s.get("文本") or ""
+        should = s.get("应读重音") or []
+        got = s.get("实读重音") or []
+        missed = s.get("漏读重音") or []
+        extra = s.get("多读重音") or []
+        L.append("    句%d  %s" % (s.get("句号"), text))
+        if should:
+            L.append("        应读重音：%s  →  %s"
+                     % ("、".join("【%s】" % w for w in should),
+                        _mark_stressed_words(text, should)))
+        else:
+            L.append("        应读重音：（这句没有需要重读的词，按原样读即可）")
+        if got:
+            L.append("        你读的重音：%s  →  %s"
+                     % ("、".join("【%s】" % w for w in got),
+                        _mark_stressed_words(text, got)))
+        elif not should:
+            L.append("        你读的重音：（你也没乱加重，正确）")
+        else:
+            L.append("        你读的重音：（一个都没读出来）")
+        # 纠音：漏了 + 多了 分开说
+        if missed:
+            L.append("        ➜ 漏了：该重读的「%s」你没加重 —— 把这几个词读得比周围更响/更长。"
+                     % "、".join(missed))
+        if extra:
+            L.append("        ➜ 多了：不该重读的「%s」你加重了 —— 这几个词读轻一点、带过去。"
+                     % "、".join(extra))
+        if not missed and not extra:
+            L.append("        ➜ 重音位置完全一致，很棒。")
+    return L
+
+
 def write_report(overall, parts, phoneme, rhythm):
     L = []
     L.append("=" * 60)
@@ -672,11 +740,15 @@ def write_report(overall, parts, phoneme, rhythm):
                      % (len(st.get("原音频突出块") or []), len(st.get("我的突出块") or []),
                         len(st.get("命中") or []), len(st.get("漏（原音频有）") or []),
                         len(st.get("多（我的）") or [])))
-            miss = st.get("漏（原音频有）") or []
-            if miss:
-                L.append("          漏掉的重音：" + "、".join(x.get("块", "") for x in miss))
         # 语调：阶段 5 起降级为"仅可视化"，不出分
         L.append("    语调：仅作可视化参考（音高曲线 / 绝对响度见 节奏对比.json），不出分")
+        # 按句重音详表（10-28）：用户要的是「每句标出该读哪些重音、我读了哪些」，
+        # 不是只报一个「漏掉重音」的清单。逐句三行：应读 / 实读 / 纠音。
+        _stress_lines = _render_stress_by_sentence(rhythm)
+        if _stress_lines:
+            L.append("")
+            L.append("    重音位置逐句对照（【】框出的词 = 该重读的词）：")
+            L.extend(_stress_lines)
     L.append("")
 
     # 五、改进建议
