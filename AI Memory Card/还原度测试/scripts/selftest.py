@@ -1012,6 +1012,26 @@ check("渲染含可疑计数", any("可疑" in ln for ln in _fa_lines), True)
 check("空输入渲染为空列表", cl.render_forced_align(None), [])
 check("无模仿侧渲染为空列表", cl.render_forced_align({"原音频": {}}), [])
 
+# overall_score._render_forced_align_correction：综合报告里的逐音纠音（10-29）
+_os_fa = {"强制对齐": {"模仿": {"逐音后验": _fa_aligned2,
+                                "可疑": _verdict},
+                       "原音频": {"可疑": []}}}
+_os_fa_lines = os_._render_forced_align_correction(_os_fa)
+check("综合报告纠音渲染非空", bool(_os_fa_lines), True)
+check("综合报告纠音含「口音型」类别", any("口音型" in ln for ln in _os_fa_lines), True)
+# 构造一条口音型条目，验证带 L2 要领
+_os_fa_l2 = {"强制对齐": {"模仿": {"逐音后验": [{"音素": "θ"}],
+                                   "可疑": [{"音素": "θ", "后验": 0.1, "实读": "f",
+                                            "类别": "口音型"}]},
+                          "原音频": {"可疑": []}}}
+_os_fa_l2_lines = os_._render_forced_align_correction(_os_fa_l2)
+check("口音型条目带 L2 要领",
+      any("θ → f" in ln and "咬舌" in ln for ln in _os_fa_l2_lines), True)
+# 无强制对齐数据 → 返回空列表
+check("无强制对齐数据返回空列表", os_._render_forced_align_correction({}), [])
+check("无可疑音返回空列表",
+      os_._render_forced_align_correction({"强制对齐": {"模仿": {"可疑": []}}}), [])
+
 
 # ==========================================================================
 # 汇总

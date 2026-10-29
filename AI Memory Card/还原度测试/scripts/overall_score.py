@@ -509,6 +509,74 @@ def _render_stress_by_sentence(rhythm):
     return L
 
 
+def _render_forced_align_correction(phoneme):
+    """把强制对齐的可疑音渲染成逐音纠音（格式对齐 difflib：应读→实读+要领）。
+
+    10-29 加：强制对齐与 difflib 并行、不参与评分。这里把它的可疑音
+    按四类渲染成可执行的纠音，让综合报告里也能看到更细的口径。
+    """
+    fa = (phoneme or {}).get("强制对齐") or {}
+    mine = fa.get("模仿") or {}
+    suspicious = mine.get("可疑") or []
+    aligned = mine.get("逐音后验") or []
+    if not suspicious:
+        return []
+    ref_susp = ((fa.get("原音频") or {}).get("可疑")) or []
+
+    import compare_phoneme as _cp
+    L = []
+    L.append("-" * 60)
+    L.append("三、强制对齐逐音纠音（更细口径 · 不参与评分）")
+    L.append("-" * 60)
+    L.append("   口径：拿参考音素表去录音里逐音定位，每个音给「像不像」分（后验 < 0.5 判可疑）。")
+    L.append("   读快读慢不影响，比上面的 difflib 口径能认出更多口音型。")
+    L.append("   模仿：%d 音素对齐，可疑 %d 处 ｜  原音频（母语者基准）可疑 %d 处"
+             % (len(aligned), len(suspicious), len(ref_susp)))
+
+    cats = {"口音型": [], "没读出来": [], "读太轻": [], "其他": []}
+    for v in suspicious:
+        cats.setdefault(v.get("类别") or "其他", []).append(v)
+
+    if cats["口音型"]:
+        L.append("")
+        L.append("   【口音型】%d 处 —— 学习者典型音变，优先练发音" % len(cats["口音型"]))
+        for v in cats["口音型"]:
+            ref_ph, got_ph = v.get("音素"), v.get("实读")
+            tip = _cp.L2_CONFUSIONS.get((ref_ph, got_ph), "")
+            line = "      · %s → %s（后验 %.2f）" % (ref_ph, got_ph, v.get("后验", 0))
+            if tip:
+                line += "   %s" % tip
+            L.append(line)
+
+    if cats["没读出来"]:
+        L.append("")
+        L.append("   【没读出来】%d 处 —— 读太轻/漏读，练清晰度" % len(cats["没读出来"]))
+        for v in cats["没读出来"]:
+            ref_ph = v.get("音素")
+            tip = _cp.PHONEME_TIPS.get(ref_ph, "")
+            line = "      · %s 这个音没出来（后验 %.2f）" % (ref_ph, v.get("后验", 0))
+            if tip:
+                line += "   %s" % tip
+            L.append(line)
+
+    if cats["读太轻"]:
+        L.append("")
+        L.append("   【读太轻】%d 处 —— 读对了但太轻，读清晰一点" % len(cats["读太轻"]))
+        L.append("      " + "、".join(v.get("音素", "") for v in cats["读太轻"]))
+
+    if cats["其他"]:
+        L.append("")
+        L.append("   【其他替换】%d 处" % len(cats["其他"]))
+        for v in cats["其他"]:
+            ref_ph, got_ph = v.get("音素"), v.get("实读")
+            tip = _cp.PHONEME_TIPS.get(ref_ph, "")
+            line = "      · %s → %s（后验 %.2f）" % (ref_ph, got_ph, v.get("后验", 0))
+            if tip:
+                line += "   %s" % tip
+            L.append(line)
+    return L
+
+
 def write_report(overall, parts, phoneme, rhythm):
     L = []
     L.append("=" * 60)
@@ -680,6 +748,11 @@ def write_report(overall, parts, phoneme, rhythm):
     else:
         L.append("    （音素序列完全一致，很棒）")
     L.append("")
+    # 强制对齐逐音纠音（10-29 加，与 difflib 并列，不参与评分）
+    _fa_corr = _render_forced_align_correction(phoneme)
+    if _fa_corr:
+        L.extend(_fa_corr)
+        L.append("")
     # 原句
     words = phoneme.get("词表") or []
     problem_words = set()
@@ -703,14 +776,14 @@ def write_report(overall, parts, phoneme, rhythm):
         sent = " ".join(("【%s】" % w["word"]) if w["word"] in problem_words else w["word"]
                        for w in words)
         L.append("-" * 60)
-        L.append("三、原句（有问题的词已用【】框出）")
+        L.append("四、原句（有问题的词已用【】框出）")
         L.append("-" * 60)
         L.append("    " + sent)
         L.append("")
 
-    # 四、节奏 / 语调
+    # 五、节奏 / 语调
     L.append("-" * 60)
-    L.append("四、节奏 / 语调")
+    L.append("五、节奏 / 语调")
     L.append("-" * 60)
     long_src = "compare_long" in (((rhythm or {}).get("节奏") or {}).get("数据源") or "")
     if phoneme.get("长音频") and not long_src:
@@ -751,9 +824,9 @@ def write_report(overall, parts, phoneme, rhythm):
             L.extend(_stress_lines)
     L.append("")
 
-    # 五、改进建议
+    # 六、改进建议
     L.append("-" * 60)
-    L.append("五、下一步怎么练")
+    L.append("六、下一步怎么练")
     L.append("-" * 60)
     for tip in build_advice(parts, phoneme, rhythm):
         L.append("    · " + tip)
