@@ -34,7 +34,7 @@ REF_CACHE_JSON = os.path.join(REF_DIR, "原音频缓存.json")   # 原音频分�
 
 sys.path.insert(0, HERE)
 from logkit import log, out, log_setup, log_done, log_step, log_error
-from audio_paths import find_audio, missing_hint, short_name
+from audio_paths import find_audio, missing_hint, short_name, reference_cache_stale
 
 # 音频格式无关：mp3 / wav / flac / ogg 都认，认不出返回 None
 # 原音频可能放在 audio\原音频\ 子目录（10-28 拆缓存后）
@@ -71,9 +71,32 @@ def ensure_reference():
     10-28 改：原音频分析结果已缓存（audio\\原音频\\原音频缓存.json）时，
     参考音素表/转写文本都是缓存里现成的，直接跳过讯飞转写和 espeak 生成。
     没缓存才需要先跑「分析原音频.bat」。
+
+    10-30 加：缓存里存了原音频指纹，换过原音频则缓存过期 —— 此时
+    **拒绝用旧缓存**（否则会用旧参考音素/logits 评测新音频、结果错乱
+    且不报错），提示重新跑「分析原音频.bat」。
     """
-    # 有缓存 → 直接复用（参考音素表已在缓存里，无需转写/生成）
+    # 有缓存 → 先做失效检测，过期则拒绝使用（10-30 加）
     if os.path.exists(REF_CACHE_JSON):
+        cache = None
+        try:
+            import json as _json
+            with open(REF_CACHE_JSON, encoding="utf-8") as f:
+                cache = _json.load(f)
+        except Exception:
+            cache = None
+        stale = reference_cache_stale(cache, REF_WAV)
+        if stale is True:
+            out("")
+            out("X 原音频缓存已过期：原音频文件换过了。")
+            out("  旧缓存里的参考音素/CTC 结果对应的是旧原音频，")
+            out("  直接拿来评测会得出错误结论。")
+            out("  请重新双击 audio\\原音频\\分析原音频.bat 重建缓存。")
+            return False
+        if stale is None:
+            # 旧版缓存没有指纹字段，无法判断是否过期 —— 保守起见提示但继续
+            log("   ⚠ 原音频缓存缺少指纹字段（旧版缓存），无法判断是否过期；"
+                "若已换过原音频请先重跑 分析原音频.bat", show=True)
         log("   有原音频缓存 → 跳过转写与参考音素表生成", show=True)
         return True
     # 没缓存：看看参考音素表是否已经在（旧流程残留），在也能跑，但要提示补缓存

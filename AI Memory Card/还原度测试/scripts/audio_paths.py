@@ -62,6 +62,51 @@ def find_audio_pair(src_dir=None):
     return find_reference(src_dir), find_audio("模仿", src_dir)
 
 
+# ---- 原音频缓存失效检测（10-30 加）-------------------------------------
+# 参考音素表有「比音频新」的过期检测，但原音频缓存（原音频缓存.json）一直
+# 没有 —— 换原音频后旧缓存不自动失效，会用旧参考音素/logits 评测新音频，
+# 结果错乱且不报错。这里给缓存加一道指纹校验。
+
+def _file_fingerprint(path):
+    """文件指纹 = (mtime 秒, 字节数)。文件不存在返回 None。"""
+    try:
+        st = os.stat(path)
+        return (int(st.st_mtime), st.st_size)
+    except Exception:
+        return None
+
+
+def reference_cache_fingerprint(cache):
+    """从缓存 dict 里读「原音频指纹」。旧缓存没这个字段返回 None。"""
+    if not cache:
+        return None
+    fp = cache.get("原音频指纹")
+    if isinstance(fp, (list, tuple)) and len(fp) == 2:
+        return (int(fp[0]), int(fp[1]))
+    return None
+
+
+def reference_cache_stale(cache, ref_path):
+    """判断原音频缓存是否过期（换过原音频）。
+
+    缓存里存的指纹（mtime+size）对不上当前原音频 → 过期，不能用。
+    返回：
+      None  —— 缓存里没有指纹字段（旧版缓存，无法判断，调用方自行决策）
+      True  —— 过期（原音频换过）
+      False —— 未过期（可放心用）
+
+    ⚠️ 为什么用 mtime+size 而不是 hash：读整段音频算 hash 对长音频是秒级开销，
+    而 mtime+size 两个数足够挡住「换了文件」的绝大多数情况；真要防「同大小
+    同时改」可再上 hash，但当前换素材场景用 mtime+size 已足够。
+    """
+    if not cache or not ref_path:
+        return None
+    cached = reference_cache_fingerprint(cache)
+    if cached is None:
+        return None
+    return cached != _file_fingerprint(ref_path)
+
+
 def short_name(path):
     """报告里显示用的短文件名（不含目录）。找不到文件时原样返回。"""
     return os.path.basename(path) if path else "（缺失）"

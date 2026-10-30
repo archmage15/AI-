@@ -37,7 +37,7 @@ XUNFEI_CONFIG = os.path.join(ROOT, "讯飞配置.json")
 
 sys.path.insert(0, HERE)
 from logkit import log, out, log_setup, log_done, log_step, log_error
-from audio_paths import find_reference, short_name
+from audio_paths import find_reference, short_name, _file_fingerprint
 import compare_phoneme as cp
 import compare_rhythm as cr
 
@@ -167,6 +167,9 @@ def main():
         "原音频_RMS": [float(x) for x in env],
         "原音频_音高": [float(x) for x in f0],
         "原音频路径": ref_path,
+        # 指纹（10-30 加）：换原音频后旧缓存要能被识别出来并拒绝使用，
+        # 否则会用旧参考音素/logits 评测新音频、结果错乱且不报错。
+        "原音频指纹": list(_file_fingerprint(ref_path)),
         "生成时间": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     os.makedirs(REF_DIR, exist_ok=True)
