@@ -14,7 +14,6 @@ r"""一键跑还原度 · 统一走长文本逐句评测（单句 = 长文本切
 用法：python scripts\run_all.py
 """
 import os
-import re
 import subprocess
 import sys
 
@@ -50,14 +49,6 @@ def audio_duration(path):
         return sf.info(path).duration
     except Exception:
         return None
-
-
-def clean_transcript(text):
-    """转写文本轻量清理：修 ASR 粘连（andWhat→and What）、压多余空白。
-    只做安全的字符级修补，不改内容。"""
-    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)     # 小写后紧跟大写 → 插空格
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
 
 
 def run_script(name, args=()):

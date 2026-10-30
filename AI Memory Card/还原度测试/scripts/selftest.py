@@ -369,7 +369,13 @@ check("碎句(1音)空 → 标忽略不判漏句", (res["忽略"], res["漏句"]
 group("6. 综合分公式与等级")
 
 stat = {"原生音数": 100, "模仿音数": 100, "替换音数": 20, "缺失音数": 5, "多余音数": 5}
-check_near("发音分 (1-替换/基准)×100", os_.score_pronunciation(stat), 80.0, 0.01)
+# 发音分 10-29 起改强制对齐口径：分母=参考音素数，分子=口音型+其他+读太轻
+fa_stat = {"参考音素数": 100, "口音型": 10, "其他": 5, "读太轻": 5, "没读出来": 10}
+check_near("发音分 (1-(口音型+其他+读太轻)/参考音素数)×100",
+           os_.score_pronunciation(fa_stat), 80.0, 0.01)
+check("「没读出来」不扣发音分（归音变）",
+      os_.score_pronunciation({"参考音素数": 100, "口音型": 0, "其他": 0,
+                               "读太轻": 0, "没读出来": 50}), 100.0)
 check_near("音变分 (1-(缺失+多余)/基准)×100", os_.score_phoneme_change(stat), 90.0, 0.01)
 check("空输入 → None（不当0 分处理）", os_.score_pronunciation(None), None)
 check("等级边界 90=优", os_.grade(90), "优")
@@ -1031,6 +1037,38 @@ check("口音型条目带 L2 要领",
 check("无强制对齐数据返回空列表", os_._render_forced_align_correction({}), [])
 check("无可疑音返回空列表",
       os_._render_forced_align_correction({"强制对齐": {"模仿": {"可疑": []}}}), [])
+
+
+# ==========================================================================
+# 转写文本修复（缩略词 + 粘连词分割）
+# ==========================================================================
+group("转写文本修复（缩略词 + 粘连词分割）")
+
+import transcript_fix as tf
+
+_tf1, _tf1c = tf.fix_transcript("Im in charge")
+check("缩略词 Im → I'm", _tf1, "I'm in charge")
+check("缩略词修复记录 1 条", len(_tf1c), 1)
+
+_tf2, _tf2c = tf.fix_transcript("wellsort of")
+check("粘连 wellsort → well sort", _tf2, "well sort of")
+check("粘连修复记录 1 条", len(_tf2c), 1)
+
+_tf3, _ = tf.fix_transcript("ohNo problem")
+check("大小写粘连 ohNo → oh No（保留旧规则）", _tf3, "oh No problem")
+
+# 不误拆正常词：wordninja 会把 blading → b+lading，必须被 MIN_SEG_LEN 挡住
+check("blading 不误拆", tf.split_glued_word("blading"), None)
+check("computer 不误拆", tf.split_glued_word("computer"), None)
+check("into 不误拆", tf.split_glued_word("into"), None)
+
+# 含撇号的不碰（it'ss 这类听错的留给人工）
+_tf4, _ = tf.fix_transcript("it'ss a deal")
+check("含撇号词不分割（it'ss 保持原样）", "it'ss" in _tf4, True)
+
+# 空输入不崩
+check("空文本返回空", tf.fix_transcript(""), ("", []))
+check("None 文本不崩", tf.fix_transcript(None), (None, []))
 
 
 # ==========================================================================

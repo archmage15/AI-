@@ -49,12 +49,10 @@ def run_script(name, args=()):
 
 
 def clean_transcript(text):
-    """转写文本轻量清理（与 run_all.clean_transcript 同规则）：
-    修 ASR 粘连（andWhat → and What）、压多余空白。"""
-    import re
-    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)     # 粘连拆开
-    text = re.sub(r"\s+", " ", text).strip()             # 压空白
-    return text
+    """转写文本清理 + 修复：大小写粘连拆开 + 缩略词（Im→I'm）+ 粘连词分割
+    （wellsort→well sort）。返回 (清理后文本, 修复记录列表)。"""
+    import transcript_fix
+    return transcript_fix.fix_transcript(text)
 
 
 def main():
@@ -89,7 +87,9 @@ def main():
         out("X 没识别到文本（转写结果为空）。")
         log_done("（转写为空，提前退出）")
         return
-    text = clean_transcript(text)
+    text, fixes = clean_transcript(text)
+    for kind, wrong, right, n in fixes:
+        out("   修复 [%s]：%r → %r（%d 处）" % (kind, wrong, right, n))
     log("   台词 %d 字符" % len(text))
 
     # ---- 2. 生成参考音素表 ----
@@ -106,27 +106,39 @@ def main():
 
     # ---- 3. CTC 识别原音频 ----
     log_step("CTC 识别原音频（跑音素模型）")
-    import torch
-    model_path = cp.ensure_model()
-    fe = cp.load_feature_extractor(model_path)
-    from transformers import AutoModelForCTC
-    model = AutoModelForCTC.from_pretrained(model_path)
-    model.eval()
-    id2tok = cp.load_vocab(model_path)
-    audio = cp.load_mono(ref_path)
-    inputs = fe(audio, sampling_rate=cp.SR, return_tensors="pt")
-    with torch.no_grad():
-        logits = model(inputs.input_values).logits
-    ids = torch.argmax(logits, dim=-1)[0].tolist()
-    ref_toks, ref_frames = cp.ctc_decode(ids, id2tok)
-    log("   原音频 %d 音素" % len(ref_toks))
-    # 帧级 logits 存 .npy（强制对齐用）。⚠️ 存二进制 .npy 而不是塞 JSON——
-    #   JSON 存 float 数组会膨胀 5~10 倍（约 2.6MB → 十几 MB），.npy 原样存。
     _logits_npy = os.path.join(REF_DIR, "原音频_logits.npy")
-    _logits_arr = logits[0].detach().cpu().numpy().astype("float32")
-    np.save(_logits_npy, _logits_arr)
-    log("   原音频 logits 已存：%s（%d 帧 × %d 符号）"
-        % (os.path.basename(_logits_npy), _logits_arr.shape[0], _logits_arr.shape[1]))
+    if os.path.exists(_logits_npy):
+        # 原音频没变 → 复用 logits 缓存，跳过 1.2GB 模型加载。
+        # （10-30 前踩过 3 次：加载模型要 30~60 秒，用户以为卡住关了窗口 →
+        #   缓存写不进来，转写/参考音素表更新了但缓存还是旧的）
+        _logits_arr = np.load(_logits_npy)
+        ids = _logits_arr.argmax(axis=1).tolist()
+        id2tok = cp.load_vocab(cp.ensure_model())
+        ref_toks, ref_frames = cp.ctc_decode(ids, id2tok)
+        log("   原音频 %d 音素（复用 logits 缓存，跳过模型加载）" % len(ref_toks))
+    else:
+        out("   ⚠ 首次运行要加载音素模型（约 1.2GB），需 30~60 秒。")
+        out("     请耐心等，这一步完成前**不要关窗口**，否则缓存写不进来。")
+        import torch
+        model_path = cp.ensure_model()
+        fe = cp.load_feature_extractor(model_path)
+        from transformers import AutoModelForCTC
+        model = AutoModelForCTC.from_pretrained(model_path)
+        model.eval()
+        id2tok = cp.load_vocab(model_path)
+        audio = cp.load_mono(ref_path)
+        inputs = fe(audio, sampling_rate=cp.SR, return_tensors="pt")
+        with torch.no_grad():
+            logits = model(inputs.input_values).logits
+        ids = torch.argmax(logits, dim=-1)[0].tolist()
+        ref_toks, ref_frames = cp.ctc_decode(ids, id2tok)
+        log("   原音频 %d 音素" % len(ref_toks))
+        # 帧级 logits 存 .npy（强制对齐用）。⚠️ 存二进制 .npy 而不是塞 JSON——
+        #   JSON 存 float 数组会膨胀 5~10 倍（约 2.6MB → 十几 MB），.npy 原样存。
+        _logits_arr = logits[0].detach().cpu().numpy().astype("float32")
+        np.save(_logits_npy, _logits_arr)
+        log("   原音频 logits 已存：%s（%d 帧 × %d 符号）"
+            % (os.path.basename(_logits_npy), _logits_arr.shape[0], _logits_arr.shape[1]))
 
     # ---- 4. 节奏/重音特征（RMS + 音高）----
     log_step("算节奏/重音特征（RMS + 音高）")

@@ -569,6 +569,21 @@ def main():
             log("   原音频（母语者基准）：可疑 %d / %d 音素"
                 % (len(verdict), len(aligned)))
 
+    # 强制对齐统计（10-29 起，发音分改用这个口径）：
+    #   发音分 = 1 - (口音型 + 其他 + 读太轻) / 参考音素数。
+    #   「没读出来」归音变（吞音漏读），不扣发音分 —— 那是清晰度问题。
+    fa_stat = None
+    if fa_result.get("模仿") and fa_result["模仿"].get("可疑") is not None:
+        _v = fa_result["模仿"]["可疑"]
+        fa_stat = {
+            "参考音素数": len(text_ph),
+            "可疑数": len(_v),
+            "口音型": sum(1 for x in _v if x["类别"] == "口音型"),
+            "没读出来": sum(1 for x in _v if x["类别"] == "没读出来"),
+            "读太轻": sum(1 for x in _v if x["类别"] == "读太轻"),
+            "其他": sum(1 for x in _v if x["类别"] == "其他"),
+        }
+
     # ---- 全局对齐（按内容，不用时间戳）----
     log_step("全局对齐（按内容）")
     sm = difflib.SequenceMatcher(a=text_ph, b=mine, autojunk=False)
@@ -615,7 +630,14 @@ def main():
         for k in total:
             total[k] += r[k]
     total_ph = total["匹配"] + total["替换"] + total["缺失"]
-    pron = max(0.0, (1 - total["替换"] / max(total_ph, 1))) * 100
+    # 发音分 10-29 起改强制对齐口径：1 - (口音型+其他+读太轻) / 参考音素数。
+    #   「没读出来」归音变（清晰度），不扣发音分。
+    #   没跑出强制对齐（如缺 logits）时回退 difflib 替换口径。
+    if fa_stat:
+        pron = max(0.0, (1 - (fa_stat["口音型"] + fa_stat["其他"] + fa_stat["读太轻"])
+                         / max(fa_stat["参考音素数"], 1))) * 100
+    else:
+        pron = max(0.0, (1 - total["替换"] / max(total_ph, 1))) * 100
     change = max(0.0, (1 - (total["缺失"] + total["多余"]) / max(total_ph, 1))) * 100
     sim = sm.ratio() * 100
 
@@ -830,6 +852,7 @@ def main():
         #   逐音后验 + 可疑音清单。目的：让用户看 difflib 漏了多少口音型。
         #   fa_result["模仿"] / ["原音频"] 各含 逐音后验 / 可疑。
         "强制对齐": fa_result,
+        "强制对齐统计": fa_stat,
         "参考音素可用": True,
     }
     with open(OUT_JSON, "w", encoding="utf-8") as f:

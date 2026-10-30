@@ -113,7 +113,7 @@ echo.
 
 rem ---------- 4. self check ----------
 echo [4/4] self-check: importing key libraries ...
-"%VPY%" -c "import numpy, soundfile, torch, transformers, huggingface_hub, matplotlib; print('      all OK'); print('      torch', torch.__version__)"
+"%VPY%" -c "import numpy, soundfile, torch, transformers, huggingface_hub, matplotlib, wordninja; print('      all OK'); print('      torch', torch.__version__)"
 if errorlevel 1 (
     echo.
     echo [ERROR] self-check failed. The error above usually names the missing lib.
