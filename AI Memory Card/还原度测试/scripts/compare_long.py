@@ -51,7 +51,7 @@ RHYTHM_JSON = os.path.join(OUT_DIR, "节奏对比.json")   # 同单句版 schema
 
 sys.path.insert(0, HERE)
 from logkit import log, out, log_setup, log_done, log_step, log_error
-from audio_paths import find_audio, missing_hint, short_name
+from audio_paths import find_audio, missing_hint, short_name, reference_cache_stale
 
 # 原音频可能放在 audio\原音频\ 子目录（10-28 拆缓存后），模仿在 audio\ 根目录
 REF_FILE = find_audio("原音频", REF_DIR) or find_audio("原音频", SRC_DIR)
@@ -122,79 +122,81 @@ def assign_mine_to_sentences(opcodes, sentences, n_ref, n_mine):
 def classify_diffs(scored):
     """把逐句差异按「性质」分类，返回 {类别: [(句号, 差异条目), ...]}。
 
-    分类（10-28 加）：这几类要采取的行动完全不同，混在一起报用户不知道该练什么：
+    分类（10-30 起，差异条目来自强制对齐的可疑音）：
       口音型（L2 音变）→ 练发音：θ→f、ð→d、ɹ→l 这类，母语者几乎不犯
       未读出           → 读太轻/漏读/被吞了，练清晰度
-      多读出           → 连读黏出来的，不扣分，注意别抢话
+      读太轻           → 读对了但太轻，读清晰一点
       替换             → 其他读错
 
-    ⚠️ 抽成独立函数有两个原因：
-       1) main() 写 payload 和人读报告**都要用** —— 之前只在报告段算，
-          main() 用不到 → UnboundLocalError（真实跑一次才发现，自检测不到）。
-       2) 抽出来才能被自检覆盖。
+    ⚠️ 差异条目的「类别」字段在 evaluate_sentence 里已统一成上述四类
+    （未读出/读太轻/口音型/替换），这里**只按类别分桶**，不再做名称映射
+    —— 若再映射一次，「未读出」会因不在映射表里被误归「替换」（10-30 踩过）。
     """
-    cats = {"口音型": [], "未读出": [], "多读出": [], "替换": []}
+    cats = {"口音型": [], "未读出": [], "读太轻": [], "替换": []}
     for r in scored or []:
         for d in r.get("差异") or []:
-            c = d.get("类别") or ("未读出" if d["类型"] == "缺失"
-                                  else "多读出" if d["类型"] == "多余" else "替换")
+            c = d.get("类别") or "替换"
             cats.setdefault(c, []).append((r["句号"], d))
     return cats
 
 
-def compute_baseline(text_ph, ref):
-    """算「母语者基准」—— 工具自己的误差底线。
+def compute_baseline(text_ph, ref_verdict):
+    """算「母语者基准」—— 工具自己的误差底线（强制对齐口径）。
 
     目的：让用户知道「这个工具自己会错多少」。
           否则 60 分看着像失败，其实母语者读同一段也只有这个水平，
           用户会以为差 40 分，实际只差 28 分。
 
-    口径必须**与本次完全一致**（同一套 difflib、同一份参考音素），
+    口径必须**与本次完全一致**（同一套强制对齐、同一份参考音素），
     才可比 —— 拿别处的数字来对比是自欺欺人。
 
-    怎么算：把**原音频自己的识别结果**当成"模仿"去跟参考音素比。
+    10-30 改：从 difflib ratio 口径切换到强制对齐口径（发音/音变分都已
+    改用强制对齐，母语者基准必须跟它们同口径才能减出「真实差距」）。
+    怎么算：把**原音频自己的强制对齐可疑音**当成"模仿"去跟参考音素比。
           原音频 = 母语者 + 干净录音 = 工具的误差底线。
-          它也判错的那些音 → 工具的固有误差（不是任何人的问题）。
+          它也被判可疑的那些音 → 工具的固有误差（不是任何人的问题）。
 
     参数
-      text_ph : 参考音素序列
-      ref     : 原音频的识别音素序列
+      text_ph     : 参考音素序列
+      ref_verdict : 原音频的强制对齐可疑音清单（align_phone_verdict 输出，
+                    每个含 类别/音素/下标）
     返回 dict；输入为空时返回 None。
-
-    ⚠️ 抽成独立函数是为了能自检 —— 放在 main() 里的话，
-       变异测试根本测不到「基准算错」这种错（10-28 踩过）。
     """
-    if not text_ph or not ref:
+    if not text_ph or ref_verdict is None:
         return None
-    try:
-        sm_b = difflib.SequenceMatcher(a=text_ph, b=ref, autojunk=False)
-        b_stat = {"匹配": 0, "替换": 0, "缺失": 0, "多余": 0}
-        for op, i1, i2, j1, j2 in sm_b.get_opcodes():
-            if op == "equal":
-                b_stat["匹配"] += i2 - i1
-            elif op == "replace":
-                b_stat["替换"] += max(i2 - i1, j2 - j1)
-            elif op == "delete":
-                b_stat["缺失"] += i2 - i1
-            else:
-                b_stat["多余"] += j2 - j1
-        b_ph = b_stat["匹配"] + b_stat["替换"] + b_stat["缺失"]
-        return {
-            "口径": "原音频自己跟参考音素比（母语者+干净录音 = 工具误差底线）",
-            "相似度": round(sm_b.ratio() * 100, 1),
-            "替换": b_stat["替换"], "缺失": b_stat["缺失"], "多余": b_stat["多余"],
-            "原生音数": b_ph,
-            "替换率": round(100.0 * b_stat["替换"] / max(b_ph, 1), 1),
-        }
-    except Exception:
-        return None
+    n_ref = len(text_ph)
+    # 母语者基准的可疑率 = 原音频被判可疑的音数 / 参考音素数
+    n_susp = len(ref_verdict)
+    l2 = sum(1 for v in ref_verdict if v.get("类别") == "口音型")
+    miss = sum(1 for v in ref_verdict if v.get("类别") == "没读出来")
+    return {
+        "口径": "原音频强制对齐可疑率（母语者+干净录音 = 工具误差底线）",
+        "可疑数": n_susp,
+        "可疑率": round(100.0 * n_susp / max(n_ref, 1), 1),
+        "口音型": l2,
+        "没读出来": miss,
+        "参考音素数": n_ref,
+    }
 
 
-def evaluate_sentence(sent, text_ph, mine, mine_frames, word_bounds):
-    """单句评测：句内各自做 difflib 对齐 + 词归属。
+def evaluate_sentence(sent, text_ph, mine, mine_frames, word_bounds, sent_susp):
+    """单句评测：漏句/碎句判断 + 归句的强制对齐可疑音（差异明细）。
 
-    返回 dict：句号/文本/匹配/替换/缺失/多余/漏句/忽略/问题词列表
-    “忽略”= 参考音素少于 MIN_SENT_PH 的碎句（转写瑕疵），不判漏句也不计分。
+    10-30 改：删掉句内 difflib 评分对齐（那是「替换/缺失/多余」错位假象的根源）。
+    差异明细改由**强制对齐的可疑音**按参考音素下标归句提供 —— 强制对齐是
+    「已知要读什么，去音频里找它在哪」，逐音给后验，读快读慢不影响，
+    不会像 difflib 那样把整词错位。
+
+    参数
+      sent        : 句子 dict（含 a/b 音素区间、句号、文本、_mine 分配的模仿音素下标）
+      text_ph     : 完整参考音素序列
+      mine        : 模仿识别音素序列
+      mine_frames : 模仿音素帧号
+      word_bounds : 词边界（用于差异条目挂词标签）
+      sent_susp   : 归到本句的强制对齐可疑音清单（已按下标过滤）
+
+    返回 dict：句号/文本/音素区间/参考音素/模仿音素/参考音素数/模仿音素数/
+              漏句/忽略/差异/问题词
     """
     sa, sb = sent["a"], sent["b"]
     sent_ref = text_ph[sa:sb]
@@ -202,101 +204,73 @@ def evaluate_sentence(sent, text_ph, mine, mine_frames, word_bounds):
     sent_words = [dict(wb, a=wb["a"] - sa, b=wb["b"] - sa)
                   for wb in word_bounds if wb["a"] >= sa and wb["b"] <= sb]
 
-    # 全局对齐分配给本句的模仿音素（由调用方填进 sent["_mine"]）
     mine_ids = sent["_mine"]
     sent_mine = [mine[j] for j in mine_ids]
     sent_frames = [mine_frames[j] for j in mine_ids]
 
-    # 句内对齐（短序列，对齐质量回到单句级别）
-    sm = difflib.SequenceMatcher(a=sent_ref, b=sent_mine, autojunk=False)
-    stat = {"匹配": 0, "替换": 0, "缺失": 0, "多余": 0}
+    # 句内参考位置 -> 词标签（差异条目挂词用，口径同 compare_phoneme.format_words）
+    def word_at(pos):
+        for wb in sent_words:
+            if wb["a"] <= pos < wb["b"]:
+                return wb["word"]
+        return None
+
+    # 差异明细：本句的强制对齐可疑音（sent_susp 已按下标归好，含「下标」是全局下标）
     diff_items = []
+    for v in sent_susp or []:
+        pos = v["下标"] - sa              # 转成句内下标
+        word = word_at(pos)
+        label = ("【单词 \"%s\"】" % word) if word else ""
+        ref_ph = v.get("音素", "")
+        got = v.get("实读", "")
+        cat = v.get("类别", "其他")
+        if cat == "没读出来":
+            tip = "【要领】这个音没读出来（可能读太轻、漏读或被吞掉了）"
+            _g = cp.phoneme_tips(ref_ph)
+            if _g:
+                tip += "　" + _g
+            diff_items.append({"类型": "缺失", "词": label, "应读": ref_ph,
+                               "实读": "", "类别": "未读出", "要领": tip,
+                               "后验": v.get("后验", 0)})
+        elif cat == "读太轻":
+            tip = "【要领】读对了但太轻，读清晰一点"
+            diff_items.append({"类型": "替换", "词": label, "应读": ref_ph,
+                               "实读": got, "类别": "读太轻", "要领": tip,
+                               "后验": v.get("后验", 0)})
+        elif cat == "口音型":
+            tip = cp.L2_CONFUSIONS.get((ref_ph, got), "") or cp.phoneme_tips(ref_ph)
+            diff_items.append({"类型": "替换", "词": label, "应读": ref_ph,
+                               "实读": got, "类别": "口音型",
+                               "要领": ("【口音型】%s → %s：%s" % (ref_ph, got, tip)) if tip else "",
+                               "后验": v.get("后验", 0)})
+        else:  # 其他替换
+            tip = cp.phoneme_tips(ref_ph)
+            diff_items.append({"类型": "替换", "词": label, "应读": ref_ph,
+                               "实读": got, "类别": "替换", "要领": tip,
+                               "后验": v.get("后验", 0)})
 
-    def words_overlapping(i1, i2):
-        """句内参考区间 [i1,i2) 压到的词（用于差异行挂词标签）。
-        契约（见 compare_phoneme.format_words 注释）：overall_score.py 会按
-        双引号反向解析这些标签取"问题词"，所以引号必须成对、包单个词。"""
-        hit = [wb["word"] for wb in sent_words if wb["a"] < i2 and i1 < wb["b"]]
-        if not hit:
-            return ""
-        if len(hit) == 1:
-            return "【单词 \"%s\"】" % hit[0]
-        return "【单词 \"%s\" → \"%s\" 之间】" % (hit[0], hit[-1])
-
-    for op, i1, i2, j1, j2 in sm.get_opcodes():
-        if op == "equal":
-            stat["匹配"] += (i2 - i1)
-        elif op == "replace":
-            stat["替换"] += max(i2 - i1, j2 - j1)
-            _ref = " ".join(sent_ref[i1:i2])
-            _got = " ".join(sent_mine[j1:j2])
-            # 分类（10-28 加）：口音型 vs 其他替换。
-            #   口音型 = 命中 L2 对照表（θ→f、ð→d、ɹ→l 这类）→ 给针对性改法
-            #   其他替换 → 就是普通的读错，给通用要领
-            #
-            # ⚠️ 要在**大块**里逐音配对 —— difflib 会把连续几个音的变化挤成一块
-            #   （如「θ æ ŋ」→「f ɛ」其实是 θ→f、æ→ɛ 两个音变），
-            #   只做整块一对一判定会漏掉绝大部分（真实跑出来发现：只认出 2 处）。
-            _l2 = cp.l2_tip(_ref, _got)          # 整块一对一
-            if not _l2:
-                _pairs = cp.align_l2_pairs(_ref, _got)   # 块内逐音配对
-                if _pairs:
-                    _l2 = "；".join(p[2] for p in _pairs)
-            diff_items.append({"类型": "替换", "词": words_overlapping(i1, i2),
-                               "应读": _ref, "实读": _got,
-                               "类别": "口音型" if _l2 else "替换",
-                               "要领": _l2 or cp.phoneme_tips(_ref)})
-        elif op == "delete":
-            stat["缺失"] += (i2 - i1)
-            # 缺失 = 参考里有、实际没发出来 → **跟"读错"是两回事**，
-            # 要领必须先说"没读出来"，再补通用发音要领。
-            # ⚠️ 原来写成 `phoneme_tips(ref) or "没读出来"` —— or 是短路的，
-            #    通用要领一旦有值，"没读出来"就被挤掉了，用户还是不知道
-            #    该练的是清晰度而不是发音（变异测试发现，已踩）。
-            _ref = " ".join(sent_ref[i1:i2])
-            _tip = ("【要领】这个音没读出来（可能读太轻、漏读或被吞掉了）")
-            _general = cp.phoneme_tips(_ref)
-            if _general:
-                _tip += "　" + _general
-            diff_items.append({"类型": "缺失", "词": words_overlapping(i1, i2),
-                               "应读": _ref, "实读": "",
-                               "类别": "未读出",
-                               "要领": _tip})
-        else:
-            stat["多余"] += (j2 - j1)
-            # 多音没有参考区间 → 挂到前一个音所在的词
-            prev = words_overlapping(max(0, i1 - 1), max(1, i1))
-            diff_items.append({"类型": "多余", "词": prev,
-                               "应读": "", "实读": " ".join(sent_mine[j1:j2]),
-                               "类别": "多读出",
-                               "要领": ""})
-
-    covered = stat["匹配"] + stat["替换"]
     # 碎句（转写把一句拆成 "There."+"Are..."）：不判漏句、不计分
     ignored = len(sent_ref) < MIN_SENT_PH
-    is_missed = (not ignored) and ((len(sent_mine) == 0) or (covered == 0))
+    # 漏句：全局对齐时这句一个模仿音素都没分到（读快读慢/跳句都不影响这句判漏）
+    is_missed = (not ignored) and (len(sent_mine) == 0)
 
-    # 词级错误：供"原句框出"用。只挑**问题严重**的词（错音≥2 或 占该词比例≥40%，
-    # 阈值同单句版 compute_word_errors）——否则满句都是框，等于没框（实测踩过）。
+    # 词级错误：供"原句框出"用。从可疑音按词归集（错音≥2 或占词比例≥40%）。
     word_problems = []
+    from collections import Counter
+    wrong_by_word = Counter()
+    for v in sent_susp or []:
+        pos = v["下标"] - sa
+        word = word_at(pos)
+        if word:
+            wrong_by_word[word] += 1
     for wb in sent_words:
-        wa, wb_ = wb["a"], wb["b"]
-        wrong = 0
-        for op, i1, i2, j1, j2 in sm.get_opcodes():
-            if op == "equal":
-                continue
-            ov = max(0, min(i2, wb_) - max(i1, wa))
-            if op == "insert":
-                # 多音归到前一个音所在的词
-                if wa <= max(0, i1 - 1) < wb_:
-                    wrong += (j2 - j1)
-            elif ov > 0:
-                wrong += ov
+        word = wb["word"]
+        wrong = wrong_by_word.get(word, 0)
         if wrong == 0:
             continue
-        ratio = wrong / float(max(wb_ - wa, 1))
+        ratio = wrong / float(max(wb["b"] - wb["a"], 1))
         if wrong >= 2 or ratio >= 0.40:
-            word_problems.append({"词": wb["word"], "错音数": wrong,
+            word_problems.append({"词": word, "错音数": wrong,
                                   "错误比例": round(ratio, 3)})
 
     return {
@@ -308,8 +282,6 @@ def evaluate_sentence(sent, text_ph, mine, mine_frames, word_bounds):
         "模仿音素": " ".join(sent_mine),
         "参考音素数": len(sent_ref),
         "模仿音素数": len(sent_mine),
-        "匹配": stat["匹配"], "替换": stat["替换"],
-        "缺失": stat["缺失"], "多余": stat["多余"],
         "漏句": is_missed,
         "忽略": ignored,
         "差异": diff_items,
@@ -390,54 +362,15 @@ def build_per_sentence_stress(block_sent_map, marked_r, marked_m, nr, nm, sent_r
     return result
 
 
-def render_forced_align(fa_result):
-    """把强制对齐对照渲染成报告文本（返回 list[str]）。
+def build_align_stat(scored, n_ref):
+    """构造对齐统计 dict（10-30 改：difflib 四类计数已删，只留基础计数）。
 
-    并行阶段（10-29）：与 difflib 并列展示、**不参与评分**，
-    目的是让用户看 difflib 漏了多少口音型。口径 = 拿参考音素表去音频里
-    逐音定位，每个音给「后验」（像不像的分）；后验 < 0.5 判可疑。
+    发音分/音变分都已改强制对齐口径（读「强制对齐统计」），这里只保留
+    「原生音数（参考音素数）+ 模仿音数」两个基础计数，供 overall_score
+    展示用，不再参与任何评分。
     """
-    if not fa_result:
-        return []
-    mine = fa_result.get("模仿")
-    if not mine:
-        return []
-    suspicious = mine.get("可疑") or []
-    aligned = mine.get("逐音后验") or []
-    ref_side = fa_result.get("原音频")
-    ref_susp = (ref_side or {}).get("可疑") or []
-
-    L = []
-    L.append("-" * 60)
-    L.append("四、强制对齐对照（与 difflib 并列 · 仅供参考 · 不参与评分）")
-    L.append("-" * 60)
-    L.append("   口径：拿参考音素表去你的录音里逐音定位，每个音给一个「像不像」分（后验）。")
-    L.append("   后验 < 0.5 判为可疑（读得不像 / 没读出来）。读快读慢不影响。")
-    L.append("   模仿：%d 音素对齐，可疑 %d 处 ｜  原音频（母语者基准）可疑 %d 处"
-             % (len(aligned), len(suspicious), len(ref_susp)))
-    cats = {"口音型": 0, "没读出来": 0, "读太轻": 0, "其他": 0}
-    for v in suspicious:
-        c = v.get("类别") or "其他"
-        cats[c] = cats.get(c, 0) + 1
-    L.append("   其中：口音型 %d ｜ 没读出来 %d ｜ 读太轻 %d ｜ 其他 %d"
-             % (cats["口音型"], cats["没读出来"], cats["读太轻"], cats["其他"]))
-
-    l2 = [v for v in suspicious if v.get("类别") == "口音型"]
-    if l2:
-        L.append("")
-        L.append("   口音型可疑（difflib 口径可能漏掉这些，这里是逐音定位出来的）：")
-        for v in l2:
-            ref_ph, got_ph = v.get("音素"), v.get("实读")
-            tip = cp.L2_CONFUSIONS.get((ref_ph, got_ph), "")
-            line = "       · %s → %s（后验 %.2f）" % (ref_ph, got_ph, v.get("后验", 0))
-            if tip:
-                line += "   %s" % tip
-            L.append(line)
-    miss = [v for v in suspicious if v.get("类别") == "没读出来"]
-    if miss:
-        L.append("   没读出来的音（%d 个）：%s"
-                 % (len(miss), "、".join(v.get("音素", "") for v in miss)))
-    return L
+    return {"原生音数": n_ref,
+            "模仿音数": sum(r["模仿音素数"] for r in scored)}
 
 
 def main():
@@ -462,6 +395,19 @@ def main():
                 ref_cache = json.load(f)
         except Exception:
             ref_cache = None
+    # 失效检测（10-30 加）：换过原音频则缓存过期，拒绝用旧缓存。
+    #   否则会用旧参考音素/logits 评测新音频、结果错乱且不报错。
+    if ref_cache:
+        stale = reference_cache_stale(ref_cache, REF_FILE)
+        if stale is True:
+            out("")
+            out("X 原音频缓存已过期：原音频文件换过了，旧缓存对应的是旧原音频。")
+            out("  直接拿来评测会得出错误结论。请重新跑 audio\\原音频\\分析原音频.bat。")
+            log_done("（原音频缓存过期，提前退出）")
+            return
+        if stale is None:
+            log("   ⚠ 原音频缓存缺少指纹字段（旧版缓存），无法判断是否过期；"
+                "若已换过原音频请先重跑 分析原音频.bat", show=True)
     if ref_cache:
         log("   用原音频缓存（跳过原音频的模型推理与特征计算）", show=True)
     else:
@@ -546,11 +492,11 @@ def main():
         return
     log("   参考 %d 音素 / %d 词 / %d 句" % (len(text_ph), len(word_bounds), len(sentences)))
 
-    # ---- 强制对齐（10-29 加，与 difflib 并行，不参与评分）----
+    # ---- 强制对齐（10-30 起：发音分/音变分/差异明细的唯一口径）----
     #   把参考音素序列对齐到两侧音频的帧级 logits，得到逐音后验。
     #   这是「已知要读什么，去音频里找它在哪」，不依赖词边界，也不怕读快读慢。
-    #   目的：对照 difflib 的口径，看它能不能认出 difflib 漏掉的口音型错误。
-    log_step("强制对齐（逐音后验，与 difflib 并行对照）")
+    #   读快读慢不影响，逐音给后验，不会像 difflib 那样整词错位。
+    log_step("强制对齐（逐音后验，发音/音变/差异明细唯一口径）")
     fa_result = {"模仿": None, "原音频": None}
     for tag, key in (("我的模仿", "模仿"), ("原音频", "原音频")):
         if tag not in logits_map:
@@ -602,8 +548,19 @@ def main():
         s["_ref"] = assign_ref.get(s["句号"], [])
 
     # ---- 逐句评测 ----
+    #   10-30 改：差异明细来自强制对齐的可疑音（按下标归句），不再做句内 difflib。
+    #   先把「模仿侧」可疑音按参考音素下标归到各句区间 [a,b)。
     log_step("逐句评测")
-    sent_results = [evaluate_sentence(s, text_ph, mine, frames_map["我的模仿"], word_bounds)
+    mine_susp = (fa_result.get("模仿") or {}).get("可疑") or []
+    sent_susp = {s["句号"]: [] for s in sentences}
+    for v in mine_susp:
+        idx = v.get("下标", -1)
+        for s in sentences:
+            if s["a"] <= idx < s["b"]:
+                sent_susp[s["句号"]].append(v)
+                break
+    sent_results = [evaluate_sentence(s, text_ph, mine, frames_map["我的模仿"],
+                                      word_bounds, sent_susp.get(s["句号"], []))
                     for s in sentences]
     scored = [r for r in sent_results if not r["漏句"] and not r["忽略"]]
     missed = [r for r in sent_results if r["漏句"]]
@@ -624,28 +581,35 @@ def main():
         log("   ⚠ 半截模仿：只读到第 %d/%d 句，后 %d 句整句未读"
             % (len(sent_results) - tail_missed, len(sent_results), tail_missed), show=True)
 
-    # ---- 汇总（按句求和，天然按音素数加权）----
-    total = {"匹配": 0, "替换": 0, "缺失": 0, "多余": 0}
-    for r in scored:                   # 漏句/碎句不计入（没读到的不算错）
-        for k in total:
-            total[k] += r[k]
-    total_ph = total["匹配"] + total["替换"] + total["缺失"]
-    # 发音分 10-29 起改强制对齐口径：1 - (口音型+其他+读太轻) / 参考音素数。
-    #   「没读出来」归音变（清晰度），不扣发音分。
-    #   没跑出强制对齐（如缺 logits）时回退 difflib 替换口径。
+    # ---- 汇总（10-30 起统一强制对齐口径，删 difflib 评分对齐）----
+    #   发音分 = 1 - (口音型+其他+读太轻) / 参考音素数
+    #   音变分 = 1 - (没读出来+读太轻) / 参考音素数
+    #   （「多余音」difflib 是假象、强制对齐单向定位又算不了，直接丢掉不扣分）
+    #   相似度 = 100 - 模仿可疑率（供展示/真实差距，统一到强制对齐口径）
+    n_ref = len(text_ph)
     if fa_stat:
         pron = max(0.0, (1 - (fa_stat["口音型"] + fa_stat["其他"] + fa_stat["读太轻"])
                          / max(fa_stat["参考音素数"], 1))) * 100
+        change = max(0.0, (1 - (fa_stat["没读出来"] + fa_stat["读太轻"])
+                            / max(fa_stat["参考音素数"], 1))) * 100
+        # 相似度：用「可疑率」的补数（100 - 可疑率）。读太轻在发音/音变都扣，
+        # 但不属于「读错」，故相似度只扣「口音型+其他+没读出来」三类硬错。
+        sim = max(0.0, (1 - (fa_stat["口音型"] + fa_stat["其他"] + fa_stat["没读出来"])
+                         / max(n_ref, 1))) * 100
     else:
-        pron = max(0.0, (1 - total["替换"] / max(total_ph, 1))) * 100
-    change = max(0.0, (1 - (total["缺失"] + total["多余"]) / max(total_ph, 1))) * 100
-    sim = sm.ratio() * 100
+        # 没跑出强制对齐（如缺 logits）→ 无法出分，记 None 由 overall_score 显示「—」
+        pron = None
+        change = None
+        sim = None
 
-    # ---- 母语者基准（10-28 加）----
-    baseline = compute_baseline(text_ph, ref)
+    # ---- 母语者基准（10-30 改强制对齐口径）----
+    #   基准 = 原音频自己的强制对齐可疑率（工具误差底线）。
+    #   真实差距 = 模仿可疑率 - 原音频可疑率（百分点），不再是 difflib ratio 之差。
+    ref_verdict = (fa_result.get("原音频") or {}).get("可疑")
+    baseline = compute_baseline(text_ph, ref_verdict)
     if baseline:
-        log("   母语者基准：相似度 %.1f ｜ 替换率 %.1f%%（工具固有误差）"
-            % (baseline["相似度"], baseline["替换率"]), verbose=True)
+        log("   母语者基准：可疑率 %.1f%%（可疑 %d 音 / %d 参考音素，工具固有误差）"
+            % (baseline["可疑率"], baseline["可疑数"], baseline["参考音素数"]), verbose=True)
 
     # ---- 节奏 / 重音（逐句两侧对称词块，整段汇总）----
     log_step("节奏 / 重音（逐句对称词块）")
@@ -725,25 +689,29 @@ def main():
     out("=" * 62)
     out("   长音频评测结果")
     out("=" * 62)
-    out("整段音素相似度：%.1f / 100" % sim)
+    out("整段音素相似度：%s / 100" % ("%.1f" % sim if sim is not None else "—"))
     if baseline:
-        out("母语者基准：%.1f / 100（原音频自己跟参考音素比 = 工具误差底线）"
-            % baseline["相似度"])
-        out("  → 你的真实差距是 %.1f 分，不是 %.1f 分"
-            % (max(0.0, baseline["相似度"] - sim), max(0.0, 100 - sim)))
+        out("母语者基准：可疑率 %.1f%%（原音频自己跟参考音素比 = 工具误差底线）"
+            % baseline["可疑率"])
+        if sim is not None:
+            out("  → 你的可疑率比母语者高 %.1f 个百分点（这就是真实差距）"
+                % max(0.0, (100 - sim) - baseline["可疑率"]))
     out("已模仿 %d / %d 句（漏读 %d 句，碎句忽略 %d 句）"
         % (len(scored), len(sent_results), len(missed), len(ignored)))
     if is_partial:
         out("⚠ 半截模仿：只读到 %.0f%%，后 %d 句未读（不计分）" % (coverage_ratio * 100, tail_missed))
-    out("发音分 %.1f ｜ 音变分 %.1f ｜ 节奏分 %.1f ｜ 重音位置 %s（仅按已模仿句计算）"
-        % (pron, change, rhythm_score,
+    out("发音分 %s ｜ 音变分 %s ｜ 节奏分 %.1f ｜ 重音位置 %s（仅按已模仿句计算）"
+        % (("%.1f" % pron) if pron is not None else "—",
+           ("%.1f" % change) if change is not None else "—",
+           rhythm_score,
            ("%.1f" % stress_pos) if stress_pos is not None else "—"))
     out("")
     for r in sent_results:
         tag = " [漏句-未读]" if r["漏句"] else (" [碎句-忽略]" if r["忽略"] else "")
-        out("  句%-2d 参考%3d音/模仿%3d音 匹配%3d 替换%2d 缺失%2d 多余%2d  %s%s"
-            % (r["句号"], r["参考音素数"], r["模仿音素数"], r["匹配"], r["替换"],
-               r["缺失"], r["多余"], r["文本"][:36], tag))
+        n_diff = len(r.get("差异") or [])
+        out("  句%-2d 参考%3d音/模仿%3d音 可疑%2d音  %s%s"
+            % (r["句号"], r["参考音素数"], r["模仿音素数"], n_diff,
+               r["文本"][:36], tag))
 
     out("")
     out("=" * 62)
@@ -772,23 +740,20 @@ def main():
 
     # ---- 写 JSON（兼容单句版 schema，overall_score.py 可直接用）----
     log_step("写结果")
-    align_stat = {"原生音数": total_ph + total["多余"],
-                  "模仿音数": sum(r["模仿音素数"] for r in scored),
-                  "匹配音数": total["匹配"], "替换音数": total["替换"],
-                  "缺失音数": total["缺失"], "多余音数": total["多余"]}
+    align_stat = build_align_stat(scored, n_ref)
     diff_lines = []
     for r in scored:
         for d in r["差异"]:
-            # 类型标记带分类（10-28）：口音型 / 未读出 / 多读出 / 替换
-            #   综合报告按这个标记分组呈现 —— 原来混在一起，用户不知道
-            #   "口音型该练发音"和"没读出该练清晰度"是两回事。
-            _cat = d.get("类别") or ("未读出" if d["类型"] == "缺失"
-                                    else "多读出" if d["类型"] == "多余" else "替换")
-            _mark = {"口音型": "口音", "未读出": "没读出",
-                     "多读出": "多读出", "替换": "替换"}.get(_cat, "替换")
+            # 类型标记带分类（10-30 改：类别来自强制对齐的四类，已无「多读出」）
+            _cat = d.get("类别") or "替换"
+            _mark = {"口音型": "口音", "未读出": "没读出", "读太轻": "读太轻",
+                     "替换": "替换"}.get(_cat, "替换")
             if _cat == "未读出":
                 line = "  [%s] 句%d %s%s：没读出来" % (_mark, r["句号"], d.get("词") or "",
                                                     ("应读 %s" % d["应读"]) if d["应读"] else "")
+            elif _cat == "读太轻":
+                line = "  [%s] 句%d %s%s：读对了但太轻" % (_mark, r["句号"], d.get("词") or "",
+                                                     ("应读 %s" % d["应读"]) if d["应读"] else "")
             else:
                 line = "  [%s] 句%d %s%s：%s" % (_mark, r["句号"], d.get("词") or "",
                                              ("应读 %s" % d["应读"]) if d["应读"] else "",
@@ -807,20 +772,16 @@ def main():
                 seen.add(wp["词"])
                 problem_words.append(wp["词"])
 
-    # 问题分类（10-28 加）：这几类要采取的行动完全不同，混在一起报，
-    # 用户不知道该练发音还是该练清晰度。
+    # 问题分类（10-30 改：类别来自强制对齐四类，已无 difflib 的「多读出」假象）。
     #   口音型（L2 音变）→ 练发音：θ→f、ð→d、ɹ→l 这类，母语者几乎不犯
     #   未读出           → 读太轻/漏读/被吞了，练清晰度
-    #   多读出           → 连读黏出来的，不扣分，注意别抢话
+    #   读太轻           → 读对了但太轻，读清晰一点
     #   替换             → 其他读错
-    # ⚠️ 必须在写 payload **之前**算 —— payload 和人读报告都要用。
-    #    之前只在报告那段算，main() 里的 payload 用不到 → UnboundLocalError
-    #    （真实跑一次才发现；自检测不到，因为自检不跑 main）。
     _cats = classify_diffs(scored)
 
     payload = {
         "原音频": ref, "我的模仿": mine,
-        "相似度": round(sim, 1), "对齐统计": align_stat,
+        "相似度": (round(sim, 1) if sim is not None else None), "对齐统计": align_stat,
         "差异": diff_lines,
         "词表": word_list,
         "问题词": problem_words,
@@ -834,7 +795,8 @@ def main():
                              "少于 %d 音的碎句忽略（转写瑕疵）" % MIN_SENT_PH},
         "长音频": {"模式": "按内容对齐·逐句评测",
                    "句子": sent_results,
-                   "发音分": round(pron, 1), "音变分": round(change, 1),
+                   "发音分": (round(pron, 1) if pron is not None else None),
+                   "音变分": (round(change, 1) if change is not None else None),
                    "节奏分": round(rhythm_score, 1),
                    "重音位置分": stress_pos,
                    "全局音素覆盖率": round(cov, 4),
@@ -842,15 +804,14 @@ def main():
                    # 混在一起报，用户不知道该练发音还是该练清晰度。
                    "问题分类": {"口音型": len(_cats.get("口音型", [])),
                                 "未读出": len(_cats.get("未读出", [])),
-                                "多读出": len(_cats.get("多读出", [])),
+                                "读太轻": len(_cats.get("读太轻", [])),
                                 "其他替换": len(_cats.get("替换", []))},
                    # 母语者基准：同口径下「工具自己会错多少」。
                    # 有了它，报告里的分数才有参照 —— 否则用户只能跟满分比，
                    # 以为差 40 分，实际母语者读同一段也差这个数。
                    "母语者基准": baseline},
-        # 强制对齐对照（10-29 加，与 difflib 并行，不参与评分）：
-        #   逐音后验 + 可疑音清单。目的：让用户看 difflib 漏了多少口音型。
-        #   fa_result["模仿"] / ["原音频"] 各含 逐音后验 / 可疑。
+        # 强制对齐（10-30 起：发音分/音变分/差异明细的唯一口径）：
+        #   逐音后验 + 可疑音清单。fa_result["模仿"] / ["原音频"] 各含 逐音后验 / 可疑。
         "强制对齐": fa_result,
         "强制对齐统计": fa_stat,
         "参考音素可用": True,
@@ -932,17 +893,16 @@ def main():
              % len(_cats.get("口音型", [])))
     L.append("   未读出的音 %d 处（读太轻/漏读，练清晰度）"
              % len(_cats.get("未读出", [])))
-    L.append("   多读出的音 %d 处（连读黏出来的，不扣分）"
-             % len(_cats.get("多读出", [])))
+    L.append("   读太轻的音 %d 处（读对了但太轻）"
+             % len(_cats.get("读太轻", [])))
     L.append("   其他替换   %d 处" % len(_cats.get("替换", [])))
     if baseline:
         L.append("")
-        L.append("   母语者基准：同一口径下，原音频自己跟参考音素比是 %.1f 分"
-                 % baseline["相似度"])
-        L.append("   → 你的 %.1f 分里，约 %.1f 分是工具固有误差，"
-                 "真实差距 %.1f 分"
-                 % (sim, max(0.0, 100 - baseline["相似度"]),
-                    max(0.0, baseline["相似度"] - sim)))
+        L.append("   母语者基准：同一口径下，原音频自己跟参考音素比，可疑率 %.1f%%"
+                 % baseline["可疑率"])
+        if sim is not None:
+            L.append("   → 你的可疑率比母语者高 %.1f 个百分点（这是真实差距）"
+                     % max(0.0, (100 - sim) - baseline["可疑率"]))
     L.append("")
     L.append("-" * 60)
     L.append("二、逐句明细")
@@ -954,23 +914,25 @@ def main():
         elif r["忽略"]:
             L.append("      [碎句] 参考音素少于 %d 个（转写瑕疵），忽略" % MIN_SENT_PH)
         else:
-            L.append("      参考 %d 音 / 模仿 %d 音 ｜ 匹配 %d 替换 %d 缺失 %d 多余 %d"
-                     % (r["参考音素数"], r["模仿音素数"], r["匹配"], r["替换"],
-                        r["缺失"], r["多余"]))
+            L.append("      参考 %d 音 / 模仿 %d 音 ｜ 可疑 %d 音"
+                     % (r["参考音素数"], r["模仿音素数"], len(r.get("差异") or [])))
             for d in r["差异"][:6]:
                 label = d.get("词") or ""
                 tip = ("   " + d["要领"]) if d.get("要领") else ""
                 cat = d.get("类别") or ""
-                if d["类型"] == "替换":
-                    mark = "口音" if cat == "口音型" else "替换"
-                    L.append("      [%s] %s应读 %s → 实读 %s%s"
-                             % (mark, label, d["应读"], d["实读"], tip))
-                elif d["类型"] == "缺失":
+                if cat == "未读出":
                     # 明确说「没读出来」——原来写"应读 X"会让人误以为要读 X
                     L.append("      [没读出] %s这个音没出来（%s）%s"
                              % (label, d["应读"], tip))
+                elif cat == "读太轻":
+                    L.append("      [读太轻] %s应读 %s（读对了但太轻）%s"
+                             % (label, d["应读"], tip))
+                elif cat == "口音型":
+                    L.append("      [口音] %s应读 %s → 实读 %s%s"
+                             % (label, d["应读"], d["实读"], tip))
                 else:
-                    L.append("      [多读出] %s多了 %s" % (label, d["实读"]))
+                    L.append("      [替换] %s应读 %s → 实读 %s%s"
+                             % (label, d["应读"], d["实读"], tip))
     # 口音型专段：把该练的音变集中列出来，一眼能抄下来练
     if _cats.get("口音型"):
         L.append("")
@@ -985,18 +947,16 @@ def main():
         if len(_cats["口音型"]) > 30:
             L.append("   （还有 %d 处，见上方逐句明细）"
                      % (len(_cats["口音型"]) - 30))
-    # 强制对齐对照（10-29 加，并行不参与评分）
-    L.extend(render_forced_align(fa_result))
     if missed:
         L.append("")
         L.append("-" * 60)
-        L.append("五、漏句清单（未读到的句子，不扣分）")
+        L.append("四、漏句清单（未读到的句子，不扣分）")
         L.append("-" * 60)
         for r in missed:
             L.append("   句%d：%s" % (r["句号"], r["文本"]))
     L.append("")
     L.append("-" * 60)
-    L.append("六、重音：先看两侧每块的判定依据，再看纠错结论")
+    L.append("五、重音：先看两侧每块的判定依据，再看纠错结论")
     L.append("-" * 60)
     L.append("")
     _nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r_all)}
@@ -1024,9 +984,11 @@ def main():
         L.append("   （无已读句，无重音判定）")
     L.append("")
     L.append("-" * 60)
-    L.append("七、汇总（仅按已模仿句）")
+    L.append("六、汇总（仅按已模仿句）")
     L.append("-" * 60)
-    L.append("   发音分 %.1f / 100 ｜ 音变分 %.1f / 100" % (pron, change))
+    L.append("   发音分 %s / 100 ｜ 音变分 %s / 100"
+             % (("%.1f" % pron) if pron is not None else "—",
+                ("%.1f" % change) if change is not None else "—"))
     L.append("   节奏分 %.1f / 100 ｜ 重音位置 %s / 100"
              % (rhythm_score, ("%.1f" % stress_pos) if stress_pos is not None else "—"))
     L.append("   净时长：原音频 %.2fs ｜ 你 %.2fs ｜ 停顿 原 %d 处 / 你 %d 处"

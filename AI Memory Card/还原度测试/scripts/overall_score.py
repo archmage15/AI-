@@ -2,7 +2,7 @@
 """还原度对比 · 总装：综合评分 + 纠音报告
 
 把前两步的产物合起来算一个"综合还原度"：
-  ① 音素对比.json  → 发音分（强制对齐口径）+ 音变分（difflib 缺音/多音）
+  ① 音素对比.json  → 发音分 + 音变分（都按强制对齐口径）
   ② 节奏对比.json  → 节奏分 + 重音位置分
 
 权重（用户定调：发音最重要，其余持平）：
@@ -78,9 +78,13 @@ MODE_SINGLE = "单句"
 # 什么时候要 +1：
 #   改了任何影响「分数怎么算」或「差异怎么归因」的东西时。
 #   纯 UI 改动、纯文案改动 → 不用 +1。
-SCORE_VERSION = 5
+SCORE_VERSION = 7
 SCORE_VERSION_NOTE = (
-    "5=10-30 标点恢复断句（讯飞句号→逗号导致三句并一句，句子边界 13→15，漏句判断口径变）；"
+    "7=10-30 删 difflib 序列比对，音变分改强制对齐口径（没读出来+读太轻/参考音素数），"
+    "母语者基准改可疑率口径，多余音删除（difflib 错位假象）；"
+    "6=10-30 修长音频「原生音数」多加了「多余」的音变分口径 bug（分母 301→280，"
+    "音变分 86→85，与 compare_long 单句模式 len(ref) 对齐）；"
+    "5=10-30 标点恢复断句（讯飞句号→逗号导致三句并一句，句子边界 13→16，漏句判断口径变）；"
     "4=10-30 讯飞错字修复生效（wellsort→well sort，词边界 87→88，节奏/重音/音变归因变）；"
     "3=10-29 发音分改用强制对齐口径（口音型+其他+读太轻 / 参考音素数）；"
     "2=10-26 修词边界错位（espeak 连读合并 → DP 对齐重建词边界）；"
@@ -209,16 +213,22 @@ def score_pronunciation(fa_stat):
     return max(0.0, (1 - wrong / base) * 100)
 
 
-def score_phoneme_change(stat):
-    """音变分：缺音（吞音/漏读）+ 多音（连读黏出来的多余音）越少越高。"""
-    if not stat:
+def score_phoneme_change(fa_stat):
+    """音变分（10-30 起改用强制对齐口径）：吞音/漏读/读太轻越少越高。
+
+    公式 = 1 − (没读出来 + 读太轻) / 参考音素数。
+    「没读出来」= 强制对齐后验低且该帧是静音/特殊符（吞音漏读）；
+    「读太轻」= 后验低但贪心仍是它自己（读对了但太轻，属弱化）。
+    与发音分共享同一份「强制对齐统计」，分母都是参考音素数。
+    ⚠️ 「多余音」已删除：difflib 的多余是整词错位假象，强制对齐单向定位
+    又算不了多余音，故不再有这一项（已知局限，见报告标注）。
+    """
+    if not fa_stat:
         return None
-    ref_n = stat.get("原生音数") or 0
-    my_n = stat.get("模仿音数") or 0
-    dele = stat.get("缺失音数") or 0
-    ins = stat.get("多余音数") or 0
-    base = max(ref_n, my_n, 1)
-    return max(0.0, (1 - (dele + ins) / base) * 100)
+    total = fa_stat.get("参考音素数") or 0
+    wrong = (fa_stat.get("没读出来") or 0) + (fa_stat.get("读太轻") or 0)
+    base = max(total, 1)
+    return max(0.0, (1 - wrong / base) * 100)
 
 
 def grade(score):
@@ -270,7 +280,7 @@ def collect_parts(phoneme, rhythm):
     rhythm_ok = bool(rhythm) and (not long_mode or "compare_long" in src)
     return {
         "发音": score_pronunciation(fa_stat),
-        "音变": score_phoneme_change(stat),
+        "音变": score_phoneme_change(fa_stat),
         "语调": rhythm.get("语调分") if rhythm_ok else None,
         "节奏": rhythm.get("节奏分") if rhythm_ok else None,
         "重音位置": score_stress_position(rhythm) if rhythm_ok else None,
@@ -343,6 +353,7 @@ def main():
 
     log_step("计算分项分与综合分")
     stat = phoneme.get("对齐统计")
+    fa_stat = phoneme.get("强制对齐统计")
     parts = collect_parts(phoneme, rhythm)
 
     # 综合分：只有拿到的项按权重归一（缺项不参与，避免误判为 0）
@@ -363,10 +374,15 @@ def main():
             % (k, ("%.1f" % v) if v is not None else "  —", int(w * 100)))
     out("")
     out("明细参考：")
-    if stat:
-        out("   音素：替换 %d ｜ 缺失 %d ｜ 多余 %d ｜ 匹配 %d（原生共 %d 音）"
-            % (stat.get("替换音数", 0), stat.get("缺失音数", 0), stat.get("多余音数", 0),
-               stat.get("匹配音数", 0), stat.get("原生音数", 0)))
+    if fa_stat:
+        out("   发音/音变（强制对齐口径）：可疑 %d 音（口音型 %d ｜ 没读出来 %d ｜ "
+            "读太轻 %d ｜ 其他 %d）／ 参考音素 %d"
+            % (fa_stat.get("可疑数", 0), fa_stat.get("口音型", 0),
+               fa_stat.get("没读出来", 0), fa_stat.get("读太轻", 0),
+               fa_stat.get("其他", 0), fa_stat.get("参考音素数", 0)))
+    elif stat:
+        out("   音素（对齐统计）：原生 %d 音 ｜ 模仿 %d 音"
+            % (stat.get("原生音数", 0), stat.get("模仿音数", 0)))
     if rhythm and not phoneme.get("长音频"):
         net = rhythm_section(rhythm, "整句净时长") or {}
         ps = rhythm_section(rhythm, "句子边界停顿") or {}
@@ -434,6 +450,11 @@ def _fmt_sent_diff(d):
         return line
     if cat == "未读出":
         line = "[没读出] %s应读 %s：没读出来" % (who, ref)
+        if tip:
+            line += "   " + tip
+        return line
+    if cat == "读太轻":
+        line = "[读太轻] %s应读 %s：读对了但太轻" % (who, ref)
         if tip:
             line += "   " + tip
         return line
@@ -514,75 +535,6 @@ def _render_stress_by_sentence(rhythm):
     return L
 
 
-def _render_forced_align_correction(phoneme):
-    """把强制对齐的可疑音渲染成逐音纠音（格式对齐 difflib：应读→实读+要领）。
-
-    10-29 加：发音分改用强制对齐口径（口音型+其他+读太轻 / 参考音素数）。
-    这里把它的可疑音按四类渲染成可执行的纠音，是发音分的依据。
-    """
-    fa = (phoneme or {}).get("强制对齐") or {}
-    mine = fa.get("模仿") or {}
-    suspicious = mine.get("可疑") or []
-    aligned = mine.get("逐音后验") or []
-    if not suspicious:
-        return []
-    ref_susp = ((fa.get("原音频") or {}).get("可疑")) or []
-
-    import compare_phoneme as _cp
-    L = []
-    L.append("-" * 60)
-    L.append("三、强制对齐逐音纠音（发音分按这个口径算）")
-    L.append("-" * 60)
-    L.append("   口径：拿参考音素表去录音里逐音定位，每个音给「像不像」分（后验 < 0.5 判可疑）。")
-    L.append("   读快读慢不影响，比上面的 difflib 口径能认出更多口音型。")
-    L.append("   发音分 = 1 −（口音型 + 其他 + 读太轻）/ 参考音素数；「没读出来」归音变，不扣发音分。")
-    L.append("   模仿：%d 音素对齐，可疑 %d 处 ｜  原音频（母语者基准）可疑 %d 处"
-             % (len(aligned), len(suspicious), len(ref_susp)))
-
-    cats = {"口音型": [], "没读出来": [], "读太轻": [], "其他": []}
-    for v in suspicious:
-        cats.setdefault(v.get("类别") or "其他", []).append(v)
-
-    if cats["口音型"]:
-        L.append("")
-        L.append("   【口音型】%d 处 —— 学习者典型音变，优先练发音" % len(cats["口音型"]))
-        for v in cats["口音型"]:
-            ref_ph, got_ph = v.get("音素"), v.get("实读")
-            tip = _cp.L2_CONFUSIONS.get((ref_ph, got_ph), "")
-            line = "      · %s → %s（后验 %.2f）" % (ref_ph, got_ph, v.get("后验", 0))
-            if tip:
-                line += "   %s" % tip
-            L.append(line)
-
-    if cats["没读出来"]:
-        L.append("")
-        L.append("   【没读出来】%d 处 —— 读太轻/漏读，练清晰度" % len(cats["没读出来"]))
-        for v in cats["没读出来"]:
-            ref_ph = v.get("音素")
-            tip = _cp.PHONEME_TIPS.get(ref_ph, "")
-            line = "      · %s 这个音没出来（后验 %.2f）" % (ref_ph, v.get("后验", 0))
-            if tip:
-                line += "   %s" % tip
-            L.append(line)
-
-    if cats["读太轻"]:
-        L.append("")
-        L.append("   【读太轻】%d 处 —— 读对了但太轻，读清晰一点" % len(cats["读太轻"]))
-        L.append("      " + "、".join(v.get("音素", "") for v in cats["读太轻"]))
-
-    if cats["其他"]:
-        L.append("")
-        L.append("   【其他替换】%d 处" % len(cats["其他"]))
-        for v in cats["其他"]:
-            ref_ph, got_ph = v.get("音素"), v.get("实读")
-            tip = _cp.PHONEME_TIPS.get(ref_ph, "")
-            line = "      · %s → %s（后验 %.2f）" % (ref_ph, got_ph, v.get("后验", 0))
-            if tip:
-                line += "   %s" % tip
-            L.append(line)
-    return L
-
-
 def write_report(overall, parts, phoneme, rhythm):
     L = []
     L.append("=" * 60)
@@ -622,15 +574,15 @@ def write_report(overall, parts, phoneme, rhythm):
     #   没有它，用户只能跟满分比 —— 60 分看着像失败，
     #   但母语者读同一段在同一口径下也只有 88.4，真实差距是 28 分不是 40 分。
     _bl = (phoneme.get("长音频") or {}).get("母语者基准")
-    if _bl and _bl.get("相似度") is not None:
+    if _bl and _bl.get("可疑率") is not None:
         _sim = phoneme.get("相似度")
         if _sim is not None:
-            L.append("（母语者基准 %.1f 分 —— 原音频自己跟参考音素比，"
-                     "是工具的误差底线；你的真实差距 %.1f 分）"
-                     % (_bl["相似度"], max(0.0, _bl["相似度"] - _sim)))
+            L.append("（母语者基准：可疑率 %.1f%% —— 原音频自己跟参考音素比，"
+                     "是工具的误差底线；你的可疑率比母语者高 %.1f 个百分点）"
+                     % (_bl["可疑率"], max(0.0, (100 - _sim) - _bl["可疑率"])))
         else:
-            L.append("（母语者基准 %.1f 分 —— 原音频自己跟参考音素比，"
-                     "是工具的误差底线）" % _bl["相似度"])
+            L.append("（母语者基准：可疑率 %.1f%% —— 原音频自己跟参考音素比，"
+                     "是工具的误差底线）" % _bl["可疑率"])
     # 进步对比：**只跟同模式 + 同口径版本的历史记录比**。
     #   单句(≤20s) 与长音频(逐句评测) 的素材长度、评分口径都不同，
     #   跨模式比会写出"进步 +4.0"这种假结论（分数变化来自素材变化）。
@@ -673,20 +625,26 @@ def write_report(overall, parts, phoneme, rhythm):
                  % (k, bar, int(w * 100), grade(v) if v is not None else ""))
     L.append("")
 
-    # 二、音变 + 发音纠音（difflib 口径，音变分按这里算）
+    # 二、发音 + 音变纠音（强制对齐口径，发音分/音变分都按这里算）
     L.append("-" * 60)
-    L.append("二、音变 + 发音纠音（difflib 口径 · 音变分按这个算）")
+    L.append("二、发音 + 音变纠音（强制对齐口径 · 发音分/音变分按这个算）")
     L.append("-" * 60)
+    L.append("   口径：拿参考音素表去录音里逐音定位，每个音给「像不像」分（后验 < 0.5 判可疑）。")
+    L.append("   发音分 = 1 −（口音型 + 其他 + 读太轻）/ 参考音素数；")
+    L.append("   音变分 = 1 −（没读出来 + 读太轻）/ 参考音素数。")
+    L.append("   ※ 不再有「多读出」这一项：difflib 的“多余”是整词错位假象，")
+    L.append("     强制对齐是单向定位、算不了多余音，故直接去掉（已知局限）。")
+    L.append("")
     diffs = phoneme.get("差异") or []
-    # 分类计数（10-28）：三类问题行动不同，先给总览
+    # 分类计数：四类问题行动不同，先给总览
     _cats = (phoneme.get("长音频") or {}).get("问题分类")
     if _cats:
         L.append("   口音型错误 %d 处 —— 学习者最典型的音变，优先练发音"
                  % _cats.get("口音型", 0))
         L.append("   未读出的音 %d 处 —— 读太轻/漏读，练清晰度"
                  % _cats.get("未读出", 0))
-        L.append("   多读出的音 %d 处 —— 连读黏出来的，不扣分"
-                 % _cats.get("多读出", 0))
+        if _cats.get("读太轻"):
+            L.append("   读太轻的音 %d 处 —— 读对了但太轻" % _cats.get("读太轻", 0))
         if _cats.get("其他替换"):
             L.append("   其他替换 %d 处" % _cats.get("其他替换", 0))
         L.append("")
@@ -707,13 +665,13 @@ def write_report(overall, parts, phoneme, rhythm):
             _sdiffs = _r.get("差异") or []
             if _sdiffs:
                 # 该句差异按四类分组
-                _sgroups = {"口音型": [], "未读出": [], "多读出": [], "替换": []}
+                _sgroups = {"口音型": [], "未读出": [], "读太轻": [], "替换": []}
                 for _d in _sdiffs:
                     _c = _d.get("类别") or "替换"
                     _sgroups.setdefault(_c, []).append(_d)
                 for _c, _title in (("口音型", "口音型"),
                                    ("未读出", "没读出"),
-                                   ("多读出", "多读出"),
+                                   ("读太轻", "读太轻"),
                                    ("替换", "其他替换")):
                     _items = _sgroups.get(_c) or []
                     if not _items:
@@ -726,10 +684,10 @@ def write_report(overall, parts, phoneme, rhythm):
             L.append("")
         L.append("    ※ [口音型] 是学习者典型音变（θ→f、ð→d 之类），"
                  "母语者几乎不犯；[没读出] 是读太轻或漏读；")
-        L.append("      [多读出] 是连读黏出来的，不扣分；[其他替换] 是普通读错。")
+        L.append("      [读太轻] 是读对了但太轻；[其他替换] 是普通读错。")
     elif diffs:
         # 单句：按类别分组呈现：先给口音型（该练发音），再给其他
-        _groups = {"口音": [], "没读出": [], "多读出": [], "替换": []}
+        _groups = {"口音": [], "没读出": [], "读太轻": [], "替换": []}
         for d in diffs:
             _s = d.strip()
             for _k in _groups:
@@ -740,7 +698,7 @@ def write_report(overall, parts, phoneme, rhythm):
                 _groups["替换"].append(_s)
         for _k, _title in (("口音", "口音型（优先练这些）"),
                            ("没读出", "没读出来的音（练清晰度）"),
-                           ("多读出", "多读出的音（不扣分）"),
+                           ("读太轻", "读太轻的音"),
                            ("替换", "其他替换")):
             if not _groups[_k]:
                 continue
@@ -750,15 +708,10 @@ def write_report(overall, parts, phoneme, rhythm):
             L.append("")
         L.append("    ※ [口音] 是学习者典型音变（θ→f、ð→d 之类），"
                  "母语者几乎不犯；[没读出] 是读太轻或漏读；")
-        L.append("      [多读出] 是连读黏出来的，不扣分；[替换] 是其他读错。")
+        L.append("      [读太轻] 是读对了但太轻；[替换] 是其他读错。")
     else:
         L.append("    （音素序列完全一致，很棒）")
     L.append("")
-    # 强制对齐逐音纠音（10-29 加，发音分按这个口径算）
-    _fa_corr = _render_forced_align_correction(phoneme)
-    if _fa_corr:
-        L.extend(_fa_corr)
-        L.append("")
     # 原句
     words = phoneme.get("词表") or []
     problem_words = set()

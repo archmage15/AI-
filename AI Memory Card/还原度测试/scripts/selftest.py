@@ -343,23 +343,24 @@ assign = cl.assign_mine_to_sentences(sm.get_opcodes(), sentences, 8, 4)
 check("只读前2句 → 句3无分配", assign.get(3), [])
 check("只读前2句 → 句4无分配", assign.get(4), [])
 
-# 逐句评测：完整句不该判漏句
+# 逐句评测：完整句不该判漏句（10-30 改：evaluate_sentence 签名加了 sent_susp，
+# 返回不再有 匹配/替换/缺失/多余，差异来自强制对齐可疑音）
 sent = {"句号": 1, "文本": "ab", "a": 0, "b": 2, "_mine": [0, 1]}
 wb_local = [{"word": "ab", "a": 0, "b": 2, "角色": "A"}]
-res = cl.evaluate_sentence(sent, text_ph, list(text_ph), [0.0, 0.1], wb_local)
+res = cl.evaluate_sentence(sent, text_ph, list(text_ph), [0.0, 0.1], wb_local, [])
 check("完整句不判漏句", res["漏句"], False)
-check("完整句匹配=2", res["匹配"], 2)
+check("完整句差异为空（无可疑音）", res["差异"], [])
 
 # 空句（一个模仿音素都没分到）→ 判漏句
 # ⚠️ 句子区间必须 >= MIN_SENT_PH(3) 音，否则会被判成「碎句-忽略」而不判漏句。
 # 这里用 a=2,b=6（4 音），确认是"有内容的句但完全没跟读"→ 漏句。
 sent = {"句号": 3, "文本": "cdef", "a": 2, "b": 6, "_mine": []}
-res = cl.evaluate_sentence(sent, text_ph, list(text_ph), [0.0], [])
+res = cl.evaluate_sentence(sent, text_ph, list(text_ph), [0.0], [], [])
 check("空句(4音)判漏句", res["漏句"], True)
 
 # 少于 3 音的空句 → 碎句忽略，不是漏句（10-17踩过：讯飞把 "There. Are" 拆两句）
 sent = {"句号": 9, "文本": "g", "a": 6, "b": 7, "_mine": []}
-res = cl.evaluate_sentence(sent, text_ph, list(text_ph), [0.0], [])
+res = cl.evaluate_sentence(sent, text_ph, list(text_ph), [0.0], [], [])
 check("碎句(1音)空 → 标忽略不判漏句", (res["忽略"], res["漏句"]), (True, False))
 
 
@@ -368,7 +369,6 @@ check("碎句(1音)空 → 标忽略不判漏句", (res["忽略"], res["漏句"]
 # ==========================================================================
 group("6. 综合分公式与等级")
 
-stat = {"原生音数": 100, "模仿音数": 100, "替换音数": 20, "缺失音数": 5, "多余音数": 5}
 # 发音分 10-29 起改强制对齐口径：分母=参考音素数，分子=口音型+其他+读太轻
 fa_stat = {"参考音素数": 100, "口音型": 10, "其他": 5, "读太轻": 5, "没读出来": 10}
 check_near("发音分 (1-(口音型+其他+读太轻)/参考音素数)×100",
@@ -376,11 +376,23 @@ check_near("发音分 (1-(口音型+其他+读太轻)/参考音素数)×100",
 check("「没读出来」不扣发音分（归音变）",
       os_.score_pronunciation({"参考音素数": 100, "口音型": 0, "其他": 0,
                                "读太轻": 0, "没读出来": 50}), 100.0)
-check_near("音变分 (1-(缺失+多余)/基准)×100", os_.score_phoneme_change(stat), 90.0, 0.01)
+# 音变分 10-30 起改强制对齐口径：1 - (没读出来+读太轻)/参考音素数。
+#   多余音已删除（difflib 错位假象）。
+check_near("音变分 (1-(没读出来+读太轻)/参考音素数)×100",
+           os_.score_phoneme_change(fa_stat), 85.0, 0.01)
+check("「口音型/其他」不扣音变分（归发音）",
+      os_.score_phoneme_change({"参考音素数": 100, "口音型": 30, "其他": 20,
+                                "读太轻": 0, "没读出来": 0}), 100.0)
 check("空输入 → None（不当0 分处理）", os_.score_pronunciation(None), None)
+check("空输入音变分 → None", os_.score_phoneme_change(None), None)
 check("等级边界 90=优", os_.grade(90), "优")
 check("等级边界 59.9=待加强", os_.grade(59.9), "待加强")
 check("None → —", os_.grade(None), "—")
+
+# build_align_stat（10-30 改签名）：只留 原生音数 + 模仿音数，difflib 四类已删。
+_aln = cl.build_align_stat([{"模仿音素数": 200}, {"模仿音素数": 40}], 280)
+check("原生音数 = 参考音素数（传入 n_ref）", _aln["原生音数"], 280)
+check("模仿音数 = 各句模仿音素数之和", _aln["模仿音数"], 240)
 
 
 # ==========================================================================
@@ -771,15 +783,21 @@ except Exception as e:
 check("通用要领仍能出（θ 有要领）", "咬舌" in cp.phoneme_tips("θ"), True)
 check("没有要领的音 → 空串", cp.phoneme_tips("xyzzy"), "")
 
-# ---- 集成层：差异条目必须带「类别」----
+# ---- 集成层：差异条目必须带「类别」（10-30 改：来自强制对齐可疑音）----
 # ⚠️ 只测纯函数不够 —— 变异测试发现：把 compare_long 里生成「类别」字段
-#    那行删掉，纯函数用例照样全绿（因为 l2_tip 本身没坏）。
-#    所以必须测「差异条目长什么样」。
+#    那行删掉，纯函数用例照样全绿。所以必须测「差异条目长什么样」。
+# 新口径：evaluate_sentence 的差异来自 sent_susp（强制对齐可疑音，含「下标」）。
 _sent = {"a": 0, "b": 5, "句号": 1, "文本": "that w", "_mine": [0, 1, 2, 3]}
 _text_ph = ["θ", "æ", "t", "w", "ʌ"]
-_mine = ["f", "æ", "t", "w"]              # θ 读成 f，且漏掉 ʌ
-_wb = [{"word": "that", "a": 0, "b": 3, "角色": "A"}]
-_res = cl.evaluate_sentence(_sent, _text_ph, _mine, [0, 20, 40, 60], _wb)
+_mine = ["f", "æ", "t", "w"]
+_wb = [{"word": "that", "a": 0, "b": 3, "角色": "A"},
+       {"word": "w", "a": 3, "b": 5, "角色": "A"}]
+# 强制对齐可疑音：下标0 θ→f（口音型）、下标4 ʌ 没读出来
+_sent_susp = [
+    {"音素": "θ", "实读": "f", "类别": "口音型", "下标": 0, "后验": 0.1},
+    {"音素": "ʌ", "实读": "", "类别": "没读出来", "下标": 4, "后验": 0.05},
+]
+_res = cl.evaluate_sentence(_sent, _text_ph, _mine, [0, 20, 40, 60], _wb, _sent_susp)
 _diff = _res["差异"]
 check("差异条目带类别字段", all("类别" in d for d in _diff), True)
 _kinds = set(d.get("类别") for d in _diff)
@@ -793,62 +811,52 @@ _missd = [d for d in _diff if d.get("类别") == "未读出"]
 check("未读出条目的实读为空", _missd[0]["实读"] if _missd else None, "")
 check("未读出条目明说「没读出来」",
       "没读出" in (_missd[0].get("要领") if _missd else ""), True)
+check("差异条目挂词标签（θ 属于 that）",
+      "that" in (_l2d[0].get("词") if _l2d else ""), True)
 
-# ---- 分类统计函数（main 和报告都要用；作用域错位过一次）----
-# ⚠️ 之前 _cats 只在报告段算，main() 写 payload 时用不到 →
-#    UnboundLocalError，真实跑一次才炸（自检不跑 main，测不到）。
-#    抽成函数后这里能测；也顺带保证两处用的是同一份数据。
+# ---- 分类统计函数（main 和报告都要用）----
 _cats_t = cl.classify_diffs([{"句号": 1, "差异": _diff}])
 check("分类统计：口音型 1 处", len(_cats_t.get("口音型", [])), 1)
 check("分类统计：未读出 1 处", len(_cats_t.get("未读出", [])), 1)
 check("分类统计：条目带句号", _cats_t["口音型"][0][0], 1)
 check("分类统计：空输入 → 空字典",
-      cl.classify_diffs([]), {"口音型": [], "未读出": [], "多读出": [], "替换": []})
+      cl.classify_diffs([]), {"口音型": [], "未读出": [], "读太轻": [], "替换": []})
 check("分类统计：None 输入不崩", cl.classify_diffs(None)["口音型"], [])
 
 group("12. 母语者基准（让分数有参照）")
 
-# 基准必须跟本次同口径：同样用 difflib 比「原音频 vs 参考音素」
-import difflib
-_ref_ph = ["h", "eɪ", "ð", "æ", "t", "w", "ʌ", "z"]
-# 母语者只错 1 个（θ→d）；模仿错 3 个（θ→f、ʌ→æ、z→s）
-_ref_ctc = ["h", "eɪ", "d", "æ", "t", "w", "ʌ", "z"]
-_mine_ctc = ["h", "eɪ", "f", "æ", "t", "w", "æ", "s"]
-_base = difflib.SequenceMatcher(a=_ref_ph, b=_ref_ctc, autojunk=False).ratio() * 100
-_mine_sim = difflib.SequenceMatcher(a=_ref_ph, b=_mine_ctc, autojunk=False).ratio() * 100
-check("基准相似度算出（母语者错 1 个）", round(_base, 1), 87.5)
-check("模仿相似度算出（错 3 个）", round(_mine_sim, 1), 62.5)
-# 真实差距 = 基准 - 本次，而不是 100 - 本次
-check("真实差距用基准减（不是 100 减）", round(_base - _mine_sim, 1), 25.0)
-check("按满分算差距会明显更大（37.5 vs 25.0）",
-      round(100 - _mine_sim, 1), 37.5)
-check("基准差距更小 = 更接近真实（母语者也有 12.5 分的固有误差）",
-      round(_base - _mine_sim, 1) < round(100 - _mine_sim, 1), True)
+# 基准必须跟本次同口径：强制对齐可疑率（10-30 改，删 difflib ratio）。
+_ref_ph = ["h", "eɪ", "ð", "æ", "t", "w", "ʌ", "z"]   # 8 音
+# 原音频强制对齐可疑音（母语者 + 干净录音 = 工具误差底线）：只 1 处口音型
+_ref_verdict = [{"音素": "ð", "实读": "d", "类别": "口音型", "下标": 2}]
+# 模仿强制对齐可疑音：3 处
+_mine_verdict = [
+    {"音素": "ð", "实读": "f", "类别": "口音型", "下标": 2},
+    {"音素": "ʌ", "实读": "æ", "类别": "其他", "下标": 6},
+    {"音素": "z", "实读": "s", "类别": "口音型", "下标": 7},
+]
 
-# ---- 基准计算函数本身（10-28 抽成独立函数才能自检）----
-# ⚠️ 之前基准算在 main() 里，变异测试测不到「基准算错」——
-#    变异后用例照样全绿（10-28 踩过）。抽成函数才能测。
-_bl = cl.compute_baseline(_ref_ph, _ref_ctc)
-check("基准函数能算出相似度", _bl["相似度"] if _bl else None, 87.5)
-check("基准函数统计替换数", _bl["替换"] if _bl else None, 1)
-check("基准函数算替换率", _bl["替换率"] if _bl else None, 12.5)
+# ---- 基准计算函数本身 ----
+_bl = cl.compute_baseline(_ref_ph, _ref_verdict)
+check("基准函数算出可疑率（1/8）", _bl["可疑率"] if _bl else None, 12.5)
+check("基准函数统计可疑数", _bl["可疑数"] if _bl else None, 1)
+check("基准函数统计口音型", _bl["口音型"] if _bl else None, 1)
+check("基准函数统计没读出来", _bl["没读出来"] if _bl else None, 0)
 # 关键：基准必须用「原音频」而不是「模仿」——
 #   用模仿自己的结果当基准，基准就等于本次分数，差距永远是 0（自欺欺人）。
-#   所以「正确基准」必须 ≠ 「用模仿算的假基准」。
-_bl_wrong = cl.compute_baseline(_ref_ph, _mine_ctc)
-check("用模仿当基准会得到假基准（= 本次分数，差距为 0）",
-      _bl_wrong["相似度"] if _bl_wrong else None, 62.5)
-# ⚠️ 同样先挡 None —— 变异后基准算错会返回 None，
-#    直接解包会崩，掩盖前面已经报出的失败（已踩）。
+_bl_wrong = cl.compute_baseline(_ref_ph, _mine_verdict)
+check("用模仿当基准会得到假基准（可疑率 3/8）",
+      _bl_wrong["可疑率"] if _bl_wrong else None, 37.5)
 check("正确基准 ≠ 假基准（基准确实用的是原音频）",
-      (_bl["相似度"] != _bl_wrong["相似度"])
+      (_bl["可疑率"] != _bl_wrong["可疑率"])
       if (_bl and _bl_wrong) else False, True)
-check("假基准会让真实差距变成 0（这正是要防的）",
-      round(_bl_wrong["相似度"] - _mine_sim, 1), 0.0)
 check("基准口径写明了是原音频",
       "原音频" in (_bl.get("口径") or ""), True)
-check("空参考音素 → None", cl.compute_baseline([], _ref_ctc), None)
-check("空原音频 → None", cl.compute_baseline(_ref_ph, []), None)
+check("空参考音素 → None", cl.compute_baseline([], _ref_verdict), None)
+check("空可疑清单（None）→ None", cl.compute_baseline(_ref_ph, None), None)
+# 空可疑清单但传了空列表（不是 None）→ 可疑率 0（母语者全对）
+_bl_zero = cl.compute_baseline(_ref_ph, [])
+check("可疑清单为空列表 → 可疑率 0", _bl_zero["可疑率"] if _bl_zero else None, 0.0)
 
 # ⚠️ 必须**真跑一次生成**看产物，不能查源码里有没有那个词 ——
 #    查源码的话，注释里也写着关键字段，删掉真正那行照样绿
@@ -1008,35 +1016,7 @@ _fa_th_verdict = cp.align_phone_verdict(_fa_th_aligned, ["θ", "æ"],
 _th_l2 = [v for v in _fa_th_verdict if v["音素"] == "θ" and v["类别"] == "口音型"]
 check("θ→f 判为口音型", len(_th_l2) == 1, True)
 check("θ 的实读是 f", _th_l2[0]["实读"] if _th_l2 else None, "f")
-
-# render_forced_align：渲染不崩，且含关键信息
-_fa_res = {"模仿": {"逐音后验": _fa_aligned2, "可疑": _verdict},
-           "原音频": {"逐音后验": _fa_aligned, "可疑": []}}
-_fa_lines = cl.render_forced_align(_fa_res)
-check("渲染非空", bool(_fa_lines), True)
-check("渲染含可疑计数", any("可疑" in ln for ln in _fa_lines), True)
-check("空输入渲染为空列表", cl.render_forced_align(None), [])
-check("无模仿侧渲染为空列表", cl.render_forced_align({"原音频": {}}), [])
-
-# overall_score._render_forced_align_correction：综合报告里的逐音纠音（10-29）
-_os_fa = {"强制对齐": {"模仿": {"逐音后验": _fa_aligned2,
-                                "可疑": _verdict},
-                       "原音频": {"可疑": []}}}
-_os_fa_lines = os_._render_forced_align_correction(_os_fa)
-check("综合报告纠音渲染非空", bool(_os_fa_lines), True)
-check("综合报告纠音含「口音型」类别", any("口音型" in ln for ln in _os_fa_lines), True)
-# 构造一条口音型条目，验证带 L2 要领
-_os_fa_l2 = {"强制对齐": {"模仿": {"逐音后验": [{"音素": "θ"}],
-                                   "可疑": [{"音素": "θ", "后验": 0.1, "实读": "f",
-                                            "类别": "口音型"}]},
-                          "原音频": {"可疑": []}}}
-_os_fa_l2_lines = os_._render_forced_align_correction(_os_fa_l2)
-check("口音型条目带 L2 要领",
-      any("θ → f" in ln and "咬舌" in ln for ln in _os_fa_l2_lines), True)
-# 无强制对齐数据 → 返回空列表
-check("无强制对齐数据返回空列表", os_._render_forced_align_correction({}), [])
-check("无可疑音返回空列表",
-      os_._render_forced_align_correction({"强制对齐": {"模仿": {"可疑": []}}}), [])
+check("可疑音带「下标」字段（供长音频归句）", _th_l2[0].get("下标") is not None, True)
 
 
 # ==========================================================================
@@ -1094,6 +1074,46 @@ check("特殊 token 跳过", pu._merge_and_punct(
     ["<s>", "▁hello", "</s>"], ["0", ".", "0"]), ["hello."])
 # 空输入
 check("空 token 返回空", pu._merge_and_punct([], []), [])
+
+
+# ==========================================================================
+# 原音频缓存失效检测（10-30：换原音频后旧缓存不自动失效）
+# ==========================================================================
+group("原音频缓存失效检测（锚定换素材错乱不报错的坑）")
+
+import audio_paths as ap
+
+# 指纹解析：list/tuple 都认；旧缓存无字段 → None
+check("指纹从 list 读回", ap.reference_cache_fingerprint({"原音频指纹": [1, 2]}), (1, 2))
+check("指纹从 tuple 读回", ap.reference_cache_fingerprint({"原音频指纹": (3, 4)}), (3, 4))
+check("旧缓存无指纹字段 → None", ap.reference_cache_fingerprint({"转写文本": "x"}), None)
+check("空缓存 → None", ap.reference_cache_fingerprint(None), None)
+check("指纹字段损坏 → None", ap.reference_cache_fingerprint({"原音频指纹": "abc"}), None)
+
+# 过期判定：用真实临时文件测（os.stat 拿真实 mtime/size）
+import tempfile as _tempfile
+_fp = os.path.join(os_.OUT_DIR, "_t_selftest_ref.mp3")
+try:
+    with open(_fp, "wb") as f:
+        f.write(b"x" * 100)
+    _real_fp = ap._file_fingerprint(_fp)
+    check("真实文件能算出指纹（mtime+size）", _real_fp is not None and len(_real_fp) == 2, True)
+    # 同一文件 → 未过期
+    check("指纹一致 → 未过期",
+          ap.reference_cache_stale({"原音频指纹": list(_real_fp)}, _fp), False)
+    # mtime 变（换文件内容+改大小）→ 过期
+    check("size 变了 → 过期",
+          ap.reference_cache_stale({"原音频指纹": [_real_fp[0], _real_fp[1] + 1]}, _fp), True)
+    check("mtime 变了 → 过期",
+          ap.reference_cache_stale({"原音频指纹": [_real_fp[0] + 5, _real_fp[1]]}, _fp), True)
+finally:
+    if os.path.exists(_fp):
+        os.remove(_fp)
+
+check("无指纹字段 → 无法判断（None）",
+      ap.reference_cache_stale({"转写文本": "x"}, _fp if os.path.exists(_fp) else "whatever"), None)
+check("空缓存 → None", ap.reference_cache_stale(None, "whatever"), None)
+check("无原音频路径 → None", ap.reference_cache_stale({"原音频指纹": [10, 100]}, None), None)
 
 
 # ==========================================================================

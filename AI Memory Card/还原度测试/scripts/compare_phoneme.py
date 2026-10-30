@@ -383,15 +383,16 @@ def align_phone_verdict(aligned, target_phones, argmax_ids, id2tok,
       threshold      后验低于此值判"可疑"（0~1，先取 0.5，待标定）
 
     返回 list[dict]，可疑音：
-      {"音素", "后验", "实读", "类别"}
+      {"音素", "后验", "实读", "类别", "下标"}
       类别 ∈ {"口音型", "没读出来", "其他"}
       「实读」= 对齐帧处贪心出来的符号（若仍等于参考音素，则只是读太轻）
+      「下标」= 该音在 target_phones 里的位置（10-30 加，供长音频按句归因用）
     """
     if len(aligned) != len(target_phones):
         return []
     blank, specials = 0, (1, 2, 3)
     out = []
-    for item, ref_ph in zip(aligned, target_phones):
+    for idx, (item, ref_ph) in enumerate(zip(aligned, target_phones)):
         post = item.get("后验", 0.0)
         if post >= threshold:
             continue
@@ -402,15 +403,15 @@ def align_phone_verdict(aligned, target_phones, argmax_ids, id2tok,
             got = ""                       # 该帧是静音/特殊符 → 没读出
         if not got:
             out.append({"音素": ref_ph, "后验": round(post, 3),
-                        "实读": "", "类别": "没读出来"})
+                        "实读": "", "类别": "没读出来", "下标": idx})
         elif got == ref_ph:
             # 对齐帧贪心还是它自己，只是概率低 → 读太轻，不算读错
             out.append({"音素": ref_ph, "后验": round(post, 3),
-                        "实读": got, "类别": "读太轻"})
+                        "实读": got, "类别": "读太轻", "下标": idx})
         else:
             cat = "口音型" if (ref_ph, got) in L2_CONFUSIONS else "其他"
             out.append({"音素": ref_ph, "后验": round(post, 3),
-                        "实读": got, "类别": cat})
+                        "实读": got, "类别": cat, "下标": idx})
     return out
 
 
