@@ -119,6 +119,83 @@ def assign_mine_to_sentences(opcodes, sentences, n_ref, n_mine):
     return assign
 
 
+def tokenize_words(text):
+    """把句子文本切成词（小写、去标点），返回 list[str]。
+
+    单词级对比用：只保留字母/撇号构成的词，统一小写，忽略标点/数字。
+    """
+    if not text:
+        return []
+    words = []
+    for w in text.split():
+        # 去首尾标点，保留词内撇号（I'm / it's）
+        w = w.strip(".,!?;:()[]{}\"'")
+        # 只保留含字母的词
+        if w and any(ch.isalpha() for ch in w):
+            words.append(w.lower())
+    return words
+
+
+def align_words(ref_words, my_words):
+    """两个词序列做词级对齐，返回逐词对比条目 list[dict]。
+
+    每条：
+      {"类型": "读对"|"读错"|"漏读"|"多读", "原词": str, "实读": str}
+
+    词级 difflib 对齐没有音素级那种错位假象（词是自然单元），
+    这里只用于「单词级纠音」展示，不参与评分（评分仍走强制对齐）。
+
+    ⚠️ 比较时忽略大小写（讯飞转写统一小写，但原文本词边界保留首字母大写，
+    直接比会把「Hey vs hey」误判成读错）—— 只影响判「读对/读错」，
+    展示仍用原始词。
+    """
+    out = []
+    if not ref_words and not my_words:
+        return out
+    # 对齐用 lower 后的词（讯飞统一小写，原词保留大写，直接比会把「Hey vs hey」
+    # 误判成 replace/错位），展示仍用原始词。
+    ref_key = [w.lower() for w in ref_words]
+    my_key = [w.lower() for w in my_words]
+    sm = difflib.SequenceMatcher(a=ref_key, b=my_key, autojunk=False)
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            for k in range(i1, i2):
+                out.append({"类型": "读对", "原词": ref_words[k],
+                            "实读": my_words[j1 + k - i1]})
+        elif op == "replace":
+            # 两边长度不等时逐词配对，多出的归「漏读/多读」
+            n = max(i2 - i1, j2 - j1)
+            for k in range(n):
+                rw = ref_words[i1 + k] if i1 + k < i2 else None
+                mw = my_words[j1 + k] if j1 + k < j2 else None
+                if rw is not None and mw is not None:
+                    out.append({"类型": "读错", "原词": rw, "实读": mw})
+                elif rw is not None:
+                    out.append({"类型": "漏读", "原词": rw, "实读": ""})
+                else:
+                    out.append({"类型": "多读", "原词": "", "实读": mw})
+        elif op == "delete":
+            for k in range(i1, i2):
+                out.append({"类型": "漏读", "原词": ref_words[k], "实读": ""})
+        else:  # insert
+            for k in range(j1, j2):
+                out.append({"类型": "多读", "原词": "", "实读": my_words[k]})
+    return out
+
+
+def split_sentences_text(text):
+    """把整段转写文本按句末标点切成句子（返回 list[str]，已 trim）。
+
+    与 gen_ref_phonemes 的断句口径保持一致：以句号/问号/感叹号结尾切分。
+    """
+    if not text:
+        return []
+    import re
+    # 按 . ! ? 后跟空格/结尾 切分
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
 def classify_diffs(scored):
     """把逐句差异按「性质」分类，返回 {类别: [(句号, 差异条目), ...]}。
 
@@ -492,7 +569,45 @@ def main():
         return
     log("   参考 %d 音素 / %d 词 / %d 句" % (len(text_ph), len(word_bounds), len(sentences)))
 
-    # ---- 强制对齐（10-30 起：发音分/音变分/差异明细的唯一口径）----
+    # ---- 单词级纠音（10-30 加）：转写模仿音频成文字，跟原文本逐词对齐 ----
+    #   音素级对比只能告诉你「θ 读成 f」，单词级能告诉你「Thanks 读成 Sanks」「漏了 for」。
+    #   这里转写「模仿」音频（复用讯飞），做 transcript_fix 修复，再整段词级对齐。
+    #   ⚠️ 关键：讯飞断句和原文断句常不一致（如「lesson, no problem」合并成一句），
+    #     所以**不能按句号下标一一对应**，而是把原文词序列和模仿词序列做整段对齐，
+    #     再按「原词所属句号」把对齐结果归组（10-30 踩过：按句切会整体错位）。
+    #   注意：这是**展示辅助**，不参与评分（评分仍走强制对齐），转写失败只降级不阻断。
+    word_align = {}        # 句号 -> list[逐词条目]
+    my_transcript = None   # 模仿转写整段文本（修复后）
+    try:
+        import xunfei_transcribe as xt
+        import transcript_fix as tf
+        log_step("转写模仿音频（单词级纠音）")
+        my_raw, _my_sents, _ = xt.transcribe_audio(MY_FILE)
+        my_transcript, _fixes = tf.fix_transcript(my_raw)
+        # 原词序列：按词边界顺序（每个词带句号），拼出完整原词 + 每个词归属的句号
+        ref_all_words = [wb["word"] for wb in word_bounds]
+        ref_word_sent = [wb.get("句号", 0) for wb in word_bounds]
+        my_all_words = tokenize_words(my_transcript)
+        # 整段词级对齐（词是自然单元，无音素级那种错位假象）
+        all_align = align_words(ref_all_words, my_all_words)
+        # 按原词所属句号归组：读对/读错/漏读消耗一个原词下标（与 ref_all_words 对应），
+        # 多读不消耗（归到前一个原词的句号）
+        last_sent = 1
+        ri = 0
+        for it in all_align:
+            if it["类型"] == "多读":
+                sid = ref_word_sent[min(ri, len(ref_word_sent) - 1)] if ref_word_sent else last_sent
+            else:
+                sid = ref_word_sent[ri] if ri < len(ref_word_sent) else last_sent
+                ri += 1
+            word_align.setdefault(sid, []).append(it)
+            last_sent = sid
+        log("   模仿转写：%s" % (my_transcript[:80] + ("..." if len(my_transcript) > 80 else "")))
+    except Exception as e:
+        log("   ⚠ 单词级纠音跳过（转写模仿音频失败：%s）" % e, show=True)
+        my_transcript = None
+
+
     #   把参考音素序列对齐到两侧音频的帧级 logits，得到逐音后验。
     #   这是「已知要读什么，去音频里找它在哪」，不依赖词边界，也不怕读快读慢。
     #   读快读慢不影响，逐音给后验，不会像 difflib 那样整词错位。
@@ -810,6 +925,11 @@ def main():
                    # 有了它，报告里的分数才有参照 —— 否则用户只能跟满分比，
                    # 以为差 40 分，实际母语者读同一段也差这个数。
                    "母语者基准": baseline},
+        # 单词级纠音（10-30 加）：转写模仿音频成文字，跟原文本逐词对齐。
+        #   逐词条目 {类型: 读对/读错/漏读/多读, 原词, 实读}，按句号归组。
+        #   展示辅助，不参与评分。
+        "模仿转写": my_transcript,
+        "单词级纠音": word_align,
         # 强制对齐（10-30 起：发音分/音变分/差异明细的唯一口径）：
         #   逐音后验 + 可疑音清单。fa_result["模仿"] / ["原音频"] 各含 逐音后验 / 可疑。
         "强制对齐": fa_result,
@@ -933,11 +1053,53 @@ def main():
                 else:
                     L.append("      [替换] %s应读 %s → 实读 %s%s"
                              % (label, d["应读"], d["实读"], tip))
+    # 单词级纠音（10-30 加）：转写模仿音频，跟原文本逐词对齐全量展示。
+    #   比音素级更直观 —— 直接告诉你「哪个词读错了/漏了/多读了」。
+    if word_align and my_transcript:
+        L.append("")
+        L.append("-" * 60)
+        L.append("三、单词级纠音（你实际读成了哪些词）")
+        L.append("-" * 60)
+        L.append("   逐词对照：[✓]读对 [✗]读错 [−]漏读 [+]多读")
+        L.append("")
+        for s in sentences:
+            sid = s["句号"]
+            items = word_align.get(sid) or []
+            if not items:
+                continue
+            # 原句行 + 你读的行，逐词并排；漏读/多读用占位符对齐
+            ref_line, my_line = [], []
+            for it in items:
+                if it["类型"] == "多读":
+                    ref_line.append("·")
+                    my_line.append(it["实读"])
+                elif it["类型"] == "漏读":
+                    ref_line.append(it["原词"])
+                    my_line.append("·")
+                else:
+                    ref_line.append(it["原词"])
+                    my_line.append(it["实读"])
+            L.append("  句%-2d %s" % (sid, s.get("文本", "")))
+            L.append("      原：%s" % " ".join(ref_line))
+            L.append("      我：%s" % " ".join(my_line))
+            # 只把有问题的词标出来
+            bad = [it for it in items if it["类型"] != "读对"]
+            if bad:
+                marks = []
+                for it in bad:
+                    if it["类型"] == "漏读":
+                        marks.append("漏读「%s」" % it["原词"])
+                    elif it["类型"] == "多读":
+                        marks.append("多读「%s」" % it["实读"])
+                    else:
+                        marks.append("「%s」读成「%s」" % (it["原词"], it["实读"]))
+                L.append("      ⚠ %s" % "；".join(marks))
+            L.append("")
     # 口音型专段：把该练的音变集中列出来，一眼能抄下来练
     if _cats.get("口音型"):
         L.append("")
         L.append("-" * 60)
-        L.append("三、口音型错误专段（这些是中国学习者最典型的音变，优先练）")
+        L.append("四、口音型错误专段（这些是中国学习者最典型的音变，优先练）")
         L.append("-" * 60)
         for sid, d in _cats["口音型"][:30]:
             L.append("   句%-2d %s应读 %s → 实读 %s"
@@ -950,13 +1112,13 @@ def main():
     if missed:
         L.append("")
         L.append("-" * 60)
-        L.append("四、漏句清单（未读到的句子，不扣分）")
+        L.append("五、漏句清单（未读到的句子，不扣分）")
         L.append("-" * 60)
         for r in missed:
             L.append("   句%d：%s" % (r["句号"], r["文本"]))
     L.append("")
     L.append("-" * 60)
-    L.append("五、重音：先看两侧每块的判定依据，再看纠错结论")
+    L.append("六、重音：先看两侧每块的判定依据，再看纠错结论")
     L.append("-" * 60)
     L.append("")
     _nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r_all)}
@@ -984,7 +1146,7 @@ def main():
         L.append("   （无已读句，无重音判定）")
     L.append("")
     L.append("-" * 60)
-    L.append("六、汇总（仅按已模仿句）")
+    L.append("七、汇总（仅按已模仿句）")
     L.append("-" * 60)
     L.append("   发音分 %s / 100 ｜ 音变分 %s / 100"
              % (("%.1f" % pron) if pron is not None else "—",

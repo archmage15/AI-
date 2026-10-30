@@ -146,6 +146,64 @@ def upload_whole(app_id, secret_key, task_id, upload_path):
                            % (resp.get("err_no"), resp.get("failed")))
 
 
+def transcribe_audio(src):
+    """转写任意音频，返回 (整段文本, 句子列表, 任务号)。
+
+    句子列表：list[{"文本", "开始ms", "结束ms", "说话人"}]。
+    不写文件、不落盘，供其他脚本直接复用（10-30 抽出来给 compare_long
+    转写「模仿」音频做单词级纠音用）。
+    """
+    if not src or not os.path.exists(src):
+        raise RuntimeError("找不到音频文件" + ("：" + str(src) if src else ""))
+
+    app_id, secret_key = load_keys()
+    upload_path = prep_audio(src)
+
+    file_size = os.path.getsize(upload_path)
+    resp = api_call(app_id, secret_key, "prepare", {
+        "file_len": str(file_size),
+        "file_name": os.path.basename(upload_path),
+        "slice_num": "1",                 # <10M 单分片
+        "lfasr_type": "0",                # 标准版
+        "language": "en",                 # 英文（跟读素材）
+    })
+    task_id = resp["data"]
+
+    upload_whole(app_id, secret_key, task_id, upload_path)
+    api_call(app_id, secret_key, "merge", {"task_id": task_id})
+
+    for attempt in range(1, POLL_MAX_TIMES + 1):
+        time.sleep(POLL_INTERVAL_S)
+        resp = api_call(app_id, secret_key, "getProgress", {"task_id": task_id})
+        prog = json.loads(resp["data"]) if isinstance(resp.get("data"), str) else resp.get("data", {})
+        status = prog.get("status")
+        if status == 9:
+            break
+        if status in (4, -1):
+            raise RuntimeError("转写失败：%s" % prog)
+    else:
+        raise RuntimeError("等待超时（%d 秒），任务号 %s"
+                           % (POLL_INTERVAL_S * POLL_MAX_TIMES, task_id))
+
+    resp = api_call(app_id, secret_key, "getResult", {"task_id": task_id})
+    data = json.loads(resp["data"]) if isinstance(resp.get("data"), str) else resp["data"]
+    sentences = [{"文本": seg.get("onebest", ""),
+                  "开始ms": int(seg.get("bg", 0)),
+                  "结束ms": int(seg.get("ed", 0)),
+                  "说话人": seg.get("speaker", "0")}
+                 for seg in data if seg.get("onebest")]
+    full_text = " ".join(s["文本"] for s in sentences).strip()
+    if not full_text:
+        raise RuntimeError("转写结果为空（音频里可能没有可识别的语音）")
+
+    if upload_path != src:
+        try:
+            os.remove(upload_path)        # 清理临时 16k 文件
+        except Exception:
+            pass
+    return full_text, sentences, task_id
+
+
 def main():
     log_setup("讯飞转写")
     out("=" * 62)
@@ -163,56 +221,8 @@ def main():
         log_done("（缺音频，提前退出）")
         return
 
-    log_step("读钥匙与音频预处理")
-    app_id, secret_key = load_keys()
-    upload_path = prep_audio(src)
-
-    log_step("prepare（建任务）")
-    file_size = os.path.getsize(upload_path)
-    resp = api_call(app_id, secret_key, "prepare", {
-        "file_len": str(file_size),
-        "file_name": os.path.basename(upload_path),
-        "slice_num": "1",                 # <10M 单分片
-        "lfasr_type": "0",                # 标准版
-        "language": "en",                 # 英文（跟读素材）
-    })
-    task_id = resp["data"]
-    log("   任务号：%s" % task_id, verbose=True)
-
-    log_step("upload（单分片上传）")
-    upload_whole(app_id, secret_key, task_id, upload_path)
-    log("   上传完成（%d 字节）" % file_size)
-
-    log_step("merge（通知转写）")
-    api_call(app_id, secret_key, "merge", {"task_id": task_id})
-
-    log_step("getProgress（轮询等待）")
-    for attempt in range(1, POLL_MAX_TIMES + 1):
-        time.sleep(POLL_INTERVAL_S)
-        resp = api_call(app_id, secret_key, "getProgress", {"task_id": task_id})
-        prog = json.loads(resp["data"]) if isinstance(resp.get("data"), str) else resp.get("data", {})
-        status = prog.get("status")
-        log("   [%d/%d] 状态 %s（%s）" % (attempt, POLL_MAX_TIMES, status, prog.get("desc", "")),
-            verbose=True)
-        if status == 9:
-            break
-        if status in (4, -1):
-            raise RuntimeError("转写失败：%s" % prog)
-    else:
-        raise RuntimeError("等待超时（%d 秒），任务号 %s" % (POLL_INTERVAL_S * POLL_MAX_TIMES, task_id))
-
-    log_step("getResult（取转写结果）")
-    resp = api_call(app_id, secret_key, "getResult", {"task_id": task_id})
-    data = json.loads(resp["data"]) if isinstance(resp.get("data"), str) else resp["data"]
-    # data = [{"bg":"0","ed":"4950","onebest":"...","speaker":"0","si":"0"}, ...]
-    sentences = [{"文本": seg.get("onebest", ""),
-                  "开始ms": int(seg.get("bg", 0)),
-                  "结束ms": int(seg.get("ed", 0)),
-                  "说话人": seg.get("speaker", "0")}
-                 for seg in data if seg.get("onebest")]
-    full_text = " ".join(s["文本"] for s in sentences).strip()
-    if not full_text:
-        raise RuntimeError("转写结果为空（音频里可能没有可识别的语音）")
+    log_step("讯飞转写")
+    full_text, sentences, task_id = transcribe_audio(src)
 
     with open(OUT_TXT, "w", encoding="utf-8") as f:
         f.write(full_text + "\n")
@@ -228,11 +238,6 @@ def main():
     out("")
     out("文本（人看）：audio\\转写文本.txt")
     out("数据（机器）：audio\\转写结果.json")
-    if upload_path != src:
-        try:
-            os.remove(upload_path)        # 清理临时 16k 文件
-        except Exception:
-            pass
     log_done("讯飞转写")
 
 

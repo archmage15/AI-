@@ -1117,6 +1117,57 @@ check("无原音频路径 → None", ap.reference_cache_stale({"原音频指纹"
 
 
 # ==========================================================================
+# 单词级纠音（10-30：转写模仿音频 → 逐词对齐）
+# ==========================================================================
+group("单词级纠音（tokenize_words / align_words / split_sentences_text）")
+
+check("tokenize 去标点并小写",
+      cl.tokenize_words("Thanks, for the lesson."), ["thanks", "for", "the", "lesson"])
+check("tokenize 保留词内撇号",
+      cl.tokenize_words("I'm sure."), ["i'm", "sure"])
+check("tokenize 空输入 → 空列表", cl.tokenize_words(""), [])
+check("tokenize 纯标点 → 空列表", cl.tokenize_words("... !!!"), [])
+
+# 对齐：完全一致 → 全读对
+_al = cl.align_words(["thanks", "for", "the", "lesson"], ["thanks", "for", "the", "lesson"])
+check("全对 → 4 条全读对",
+      (len(_al), all(x["类型"] == "读对" for x in _al)), (4, True))
+
+# 对齐：读错一个词（thanks → sanks）
+_al = cl.align_words(["thanks", "for", "the"], ["sanks", "for", "the"])
+_types = [x["类型"] for x in _al]
+check("读错一个词 → 读错/读对/读对", _types, ["读错", "读对", "读对"])
+check("读错的实读是 sanks", _al[0]["实读"], "sanks")
+
+# 对齐：漏读一个词（少了 for）
+_al = cl.align_words(["thanks", "for", "the"], ["thanks", "the"])
+_types = [x["类型"] for x in _al]
+check("漏读一个词 → 读对/漏读/读对", _types, ["读对", "漏读", "读对"])
+check("漏读词的原词是 for", [x for x in _al if x["类型"] == "漏读"][0]["原词"], "for")
+
+# 对齐：多读一个词（多了 yeah）
+_al = cl.align_words(["thanks", "the"], ["thanks", "yeah", "the"])
+_types = [x["类型"] for x in _al]
+check("多读一个词 → 读对/多读/读对", _types, ["读对", "多读", "读对"])
+check("多读词的实读是 yeah", [x for x in _al if x["类型"] == "多读"][0]["实读"], "yeah")
+
+# 对齐：两边都空 → 空列表
+check("两边都空 → 空列表", cl.align_words([], []), [])
+
+# 对齐：大小写不敏感（讯飞统一小写，原词保留大写，Hey vs hey 应判读对）
+_al = cl.align_words(["Hey", "thanks"], ["hey", "thanks"])
+_types = [x["类型"] for x in _al]
+check("大小写不同判读对（Hey vs hey）", _types, ["读对", "读对"])
+
+# 断句：按句末标点切分
+check("断句按句号切",
+      cl.split_sentences_text("Thanks for the lesson. So tell me. What do you do?"),
+      ["Thanks for the lesson.", "So tell me.", "What do you do?"])
+check("断句空输入 → 空列表", cl.split_sentences_text(""), [])
+check("断句无标点 → 单句", cl.split_sentences_text("hello world"), ["hello world"])
+
+
+# ==========================================================================
 # 汇总
 # ==========================================================================
 total = len(_PASS) + len(_FAIL)
