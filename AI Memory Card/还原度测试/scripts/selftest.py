@@ -1168,6 +1168,49 @@ check("断句无标点 → 单句", cl.split_sentences_text("hello world"), ["he
 
 
 # ==========================================================================
+# 转写确认环节（任务 3：confirm_transcript 的纯逻辑分支）
+# ==========================================================================
+group("转写确认（confirm_transcript 短路/读回分支）")
+import analyze_reference as ar
+
+# 1. AUTO_CONFIRM=1 → 跳过确认，直接返回原文本、无改动
+_saved_auto = ar._AUTO_CONFIRM
+ar._AUTO_CONFIRM = True
+try:
+    _r = ar.confirm_transcript("hello world")
+    check("AUTO_CONFIRM=1 → 直接返回原文本", _r, ("hello world", False))
+finally:
+    ar._AUTO_CONFIRM = _saved_auto
+
+# 2. 待确认文件已存在 → 看 should_reconfirm 的决策
+check("should_reconfirm：空 → 要弹", ar.should_reconfirm("", "x"), True)
+check("should_reconfirm：一致 → 不弹", ar.should_reconfirm("same text", "same text"), False)
+check("should_reconfirm：不一致 → 要弹", ar.should_reconfirm("old text", "new text"), True)
+
+# 3. 端到端：文件存在且内容与本次一致 → 直接读回、不弹编辑器
+_saved_confirm = ar.CONFIRM_TXT
+_conf = os.path.join(os_.OUT_DIR, "_t_selftest_confirm.txt")
+ar.CONFIRM_TXT = _conf
+try:
+    with open(_conf, "w", encoding="utf-8") as f:
+        f.write("same text\n")
+    _r = ar.confirm_transcript("same text")
+    check("已有且内容相同 → 读回、无改动", _r, ("same text", False))
+finally:
+    ar.CONFIRM_TXT = _saved_confirm
+    if os.path.exists(_conf):
+        os.remove(_conf)
+
+# split_lines / _collapse（每句一行展示 + 读回压单行）
+check("split_lines 按句末标点切行",
+      ar.split_lines("Thanks for the lesson. So tell me. What do you do?"),
+      ["Thanks for the lesson.", "So tell me.", "What do you do?"])
+check("split_lines 空输入 → 空列表", ar.split_lines(""), [])
+check("_collapse 换行压回单空格",
+      ar._collapse("Thanks.\nSo tell me.\nWhat?"), "Thanks. So tell me. What?")
+
+
+# ==========================================================================
 # 汇总
 # ==========================================================================
 total = len(_PASS) + len(_FAIL)

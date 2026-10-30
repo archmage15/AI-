@@ -55,7 +55,156 @@ def clean_transcript(text):
     return transcript_fix.fix_transcript(text)
 
 
+# 转写确认环节的待确认文件（人工兜底，任务 3）
+CONFIRM_TXT = os.path.join(REF_DIR, "转写文本_待确认.txt")
+# 跳过确认开关：环境变量 AUTO_CONFIRM=1 或命令行 --auto，无人值守时不弹编辑器
+_AUTO_CONFIRM = (os.environ.get("AUTO_CONFIRM", "").strip() in ("1", "true", "True", "yes"))
+
+
+def split_lines(text):
+    """按句末标点（. ? !）把转写文本切成一行一句，方便人工逐句核对。
+
+    只作展示用（写进待确认文件），读回时会压回单行，不影响后续生成参考音素表。
+    """
+    import re
+    # 在句末标点后切，但保留标点；去掉多余空格
+    parts = re.split(r"(?<=[.?!])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _collapse(text):
+    """把文本里的换行/多余空白压成单空格（读回待确认文件时用）。
+
+    待确认文件是「每句一行」给人看的，读回后要并回单行才能进后续流程
+    （gen_ref_phonemes 等按空格分词）。
+    """
+    import re
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def should_reconfirm(existing, text):
+    """判断是否要重新弹确认。
+
+    existing 为空 → 首次，要弹；
+    existing 与 text 一致 → 已确认过，不弹；
+    existing 与 text 不一致 → 换过原音频或上次改过，要弹。
+    """
+    if not existing:
+        return True
+    return existing != text
+
+
+def _open_in_editor(path):
+    """用系统默认编辑器打开文本文件（Windows 用 os.startfile）。失败返回 False。"""
+    try:
+        os.startfile(path)          # Windows：用默认关联程序打开
+        return True
+    except Exception:
+        try:
+            subprocess.Popen(["notepad", path])   # 兜底：显式调记事本
+            return True
+        except Exception:
+            return False
+
+
+def confirm_transcript(text):
+    """转写确认环节（人工兜底，任务 3）。
+
+    把标点恢复后的转写文本写到 CONFIRM_TXT，用编辑器打开让用户过目/修改，
+    改完保存关闭后读回。兜底两类自动修不掉的错：
+      1. 标点模型误判（句边界偏差、个别逗号误判）
+      2. 讯飞听错词（it'ss 应为 it's a）
+
+    返回 (确认后文本, 是否有改动)。
+
+    AUTO_CONFIRM=1 时跳过确认，直接用传入文本（无人值守/批量重跑不卡住）。
+    """
+    if _AUTO_CONFIRM:
+        log("   AUTO_CONFIRM=1，跳过转写确认，直接用转写结果", show=True)
+        return text, False
+
+    # 待确认文件已存在 → 看它和本次转写结果是否一致：
+    #   - 一致：这文件就是本次转写写的、且已确认过，直接采用，不重弹
+    #   - 不一致：换过原音频（旧文件是上个音频的）或上次手动改过 → 重弹确认
+    existing = ""
+    if os.path.exists(CONFIRM_TXT):
+        try:
+            with open(CONFIRM_TXT, encoding="utf-8") as f:
+                existing = _collapse(f.read())
+        except Exception:
+            existing = ""
+    if not should_reconfirm(existing, text):
+        log("   转写文本已确认过（与本次转写一致，直接采用 %d 字符）" % len(existing), show=True)
+        return existing, False
+    if existing:
+        log("   待确认文件内容与本次转写不一致（换过原音频或上次改过），重新确认",
+            show=True)
+
+    # 首次确认：写待确认文件（每句一行，方便逐句核对）+ 开编辑器 + 轮询等保存
+    try:
+        os.makedirs(REF_DIR, exist_ok=True)
+        with open(CONFIRM_TXT, "w", encoding="utf-8") as f:
+            f.write("\n".join(split_lines(text)) + "\n")
+    except Exception as e:
+        log("   ⚠ 无法写待确认文件（%s），跳过确认直接继续" % e, show=True)
+        return text, False
+
+    out("")
+    out("  ┌─ 转写确认（人工兜底）──────────────────────────")
+    out("  │ 已把转写文本写进：")
+    out("  │   audio\\原音频\\转写文本_待确认.txt")
+    out("  │ 已用编辑器打开。请过目，有错直接改，保存后关闭窗口。")
+    out("  │ 不改直接关闭 = 确认无误。")
+    out("  └────────────────────────────────────────────")
+
+    opened = _open_in_editor(CONFIRM_TXT)
+    if not opened:
+        log("   ⚠ 无法自动打开编辑器，请手动编辑：%s" % CONFIRM_TXT, show=True)
+
+    # 等用户改完保存并关闭编辑器。这里没法可靠感知「编辑器已关闭」，
+    # 改为轮询「文件内容变化后，等待一个稳定期」。
+    import time as _time
+    last_text = text
+    stable = 0
+    while True:
+        try:
+            with open(CONFIRM_TXT, encoding="utf-8") as f:
+                cur = f.read().strip()
+        except Exception:
+            cur = ""
+        if cur and cur != last_text:
+            last_text = cur
+            stable = 0            # 内容变了 → 重置稳定计数
+        else:
+            stable += 1
+        if stable >= 30:          # 约 30 秒内容不变 → 视为已确认（含「直接关闭不改」）
+            break
+        _time.sleep(1)
+
+    # 读回最终文本。用户可能删空（误删）→ 删空则沿用原文本并提示。
+    try:
+        with open(CONFIRM_TXT, encoding="utf-8") as f:
+            confirmed = _collapse(f.read())
+    except Exception:
+        confirmed = ""
+    if not confirmed:
+        log("   ⚠ 待确认文件被清空，沿用转写结果继续", show=True)
+        confirmed = text
+    changed = (confirmed != text)
+    if changed:
+        log("   已采用人工修改后的文本（%d 字符 → %d 字符）" % (len(text), len(confirmed)),
+            show=True)
+    else:
+        log("   转写文本确认无误", show=True)
+    return confirmed, changed
+
+
 def main():
+    global _AUTO_CONFIRM
+    # 命令行 --auto 跳过转写确认（与 AUTO_CONFIRM=1 环境变量等价）
+    if "--auto" in sys.argv:
+        _AUTO_CONFIRM = True
+
     log_setup("原音频分析")
     out("=" * 62)
     out("   原音频分析 · 一次性跑完并存缓存")
@@ -102,6 +251,11 @@ def main():
     except Exception as _e:
         log("   ⚠ 标点恢复失败（%s），沿用原标点继续" % _e, show=True)
     log("   台词 %d 字符" % len(text))
+
+    # ---- 1.6 转写确认（人工兜底，任务 3）----
+    # 标点恢复后、生成参考音素表前，把文本给用户过目/修改，兜底标点误判和听错词。
+    log_step("转写确认（人工兜底）")
+    text, _confirmed_changed = confirm_transcript(text)
 
     # ---- 2. 生成参考音素表 ----
     log_step("生成参考音素表（音素/词边界/句子边界）")
