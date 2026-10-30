@@ -31,6 +31,8 @@ _t_*
 **/models/*/*.safetensors
 **/models/*/tf_model.h5
 **/models/*/flax_model.msgpack
+# xlm-roberta 系 tokenizer.json 含完整词表+预计算表（~17MB），太大不进版本库
+**/models/*/tokenizer.json
 # HuggingFace 下载缓存（纯缓存，无保留价值）
 **/.cache/huggingface/
 

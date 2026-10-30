@@ -90,6 +90,17 @@ def main():
     text, fixes = clean_transcript(text)
     for kind, wrong, right, n in fixes:
         out("   修复 [%s]：%r → %r（%d 处）" % (kind, wrong, right, n))
+
+    # ---- 1.5 标点恢复（重新断句）----
+    # 讯飞常把句号标成逗号，导致三句并一句 → 用标点模型重新断句。
+    # 失败（如模型没下载）就沿用原标点继续，不中断。
+    log_step("标点恢复（重新断句，首次加载模型约 1.1GB 需十几秒）")
+    import punctuate
+    try:
+        text = punctuate.restore_punctuation(text)
+        log("   重新标点完成：%s" % (text[:60] + ("..." if len(text) > 60 else "")))
+    except Exception as _e:
+        log("   ⚠ 标点恢复失败（%s），沿用原标点继续" % _e, show=True)
     log("   台词 %d 字符" % len(text))
 
     # ---- 2. 生成参考音素表 ----

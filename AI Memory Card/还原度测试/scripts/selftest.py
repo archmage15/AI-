@@ -1072,6 +1072,31 @@ check("None 文本不崩", tf.fix_transcript(None), (None, []))
 
 
 # ==========================================================================
+# 标点恢复（subword 合并 + 词尾标点；只测纯函数，不加载 1.1GB 模型）
+# ==========================================================================
+group("标点恢复（subword 合并 + 词尾标点）")
+
+import punctuate as pu
+
+# 词尾标点：每个词后面跟它词尾 token 的标签
+check("词尾标点插入", pu._merge_and_punct(
+    ["▁specialist", "▁well", "▁sort"], [".", "0", "."]),
+    ["specialist.", "well", "sort."])
+# subword 合并：special + ist → specialist，取最后一个 subword 的标签
+check("subword 合并取词尾标签", pu._merge_and_punct(
+    ["▁special", "ist", "▁well"], ["0", ".", "0"]),
+    ["specialist.", "well"])
+# 无标点标签（0/O/空）不加标点
+check("无标点标签不加", pu._merge_and_punct(
+    ["▁hello", "▁world"], ["0", "O"]), ["hello", "world"])
+# 特殊 token 跳过
+check("特殊 token 跳过", pu._merge_and_punct(
+    ["<s>", "▁hello", "</s>"], ["0", ".", "0"]), ["hello."])
+# 空输入
+check("空 token 返回空", pu._merge_and_punct([], []), [])
+
+
+# ==========================================================================
 # 汇总
 # ==========================================================================
 total = len(_PASS) + len(_FAIL)
