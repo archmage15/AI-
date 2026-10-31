@@ -307,8 +307,9 @@ def main():
 
     # ---- 4. 节奏/重音特征（RMS + 音高）----
     log_step("算节奏/重音特征（RMS + 音高）")
-    env = cr.frame_rms(cp.load_mono(ref_path))
-    f0 = cr.pitch_contour(cp.load_mono(ref_path))
+    _ref_wave = cp.load_mono(ref_path)  # 只加载一次，RMS/音高共用
+    env = cr.frame_rms(_ref_wave)
+    f0 = cr.pitch_contour(_ref_wave)
     log("   RMS %d 帧 / 音高 %d 帧" % (len(env), len(f0)))
 
     # ---- 5. 打包缓存 ----

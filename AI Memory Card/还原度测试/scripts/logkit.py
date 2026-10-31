@@ -68,10 +68,7 @@ SESSION_GAP_S = 600
 
 # ---- 内部状态 ----
 _START = None          # 本次 main() 的起始时刻（算总耗时用）
-_TAG = ""              # 当前脚本名（写进单次日志的分隔线里）
 _warned = False        # 写盘失败只提示一次，不刷屏
-_READY = False         # log_setup 跑过之后才 true：在此之前只打印不写盘，
-                       # 这样"正在加载"提示能立刻上终端，又不会在日志里留下没头的行
 
 
 def _now():
@@ -124,9 +121,8 @@ def log_setup(tag):
     超过 SESSION_GAP_S 秒，就认为这是一轮新的运行，清空重写；否则视为
     同一轮的后续脚本，追加。这样既不用改 bat，也能让三步串在同一个文件里。
     """
-    global _START, _TAG
+    global _START
     _START = time.time()
-    _TAG = tag
 
     fresh = True
     if os.path.exists(LOG_THIS):

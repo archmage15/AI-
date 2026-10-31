@@ -736,10 +736,12 @@ def main():
         env_r = np.array(ref_cache.get("原音频_RMS") or [], dtype=float)
         f0_r = np.array(ref_cache.get("原音频_音高") or [], dtype=float)
     else:
-        env_r = cr.frame_rms(cp.load_mono(REF_FILE))
-        f0_r = cr.pitch_contour(cp.load_mono(REF_FILE))
-    env_m = cr.frame_rms(cp.load_mono(MY_FILE))
-    f0_m = cr.pitch_contour(cp.load_mono(MY_FILE))
+        _ref_wave = cp.load_mono(REF_FILE)  # 只加载一次，RMS/音高共用
+        env_r = cr.frame_rms(_ref_wave)
+        f0_r = cr.pitch_contour(_ref_wave)
+    _my_wave = cp.load_mono(MY_FILE)  # 只加载一次，RMS/音高共用
+    env_m = cr.frame_rms(_my_wave)
+    f0_m = cr.pitch_contour(_my_wave)
     # 块序号 -> 句号 映射：重音判定是整段算的（序号全局 1..N），
     # 但报告要按句展示「应读哪些重音 / 我读了哪些」，
     # 所以 extend 词块时同步记下每个块属于哪一句。
