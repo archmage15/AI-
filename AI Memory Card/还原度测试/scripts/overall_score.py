@@ -295,9 +295,9 @@ def score_stress_position(rhythm):
         return None
     sig = rhythm.get("重音_信号") or {}
     miss = sig.get("漏（原音频有）") or []
-    ref = sig.get("原音频突出块") or []
+    ref = sig.get("原音频重读词") or []
     if not ref:
-        return None       # 原音频一个突出块都没判出来 → 没基准，不出分
+        return None       # 原音频一个重读词都没判出来 → 没基准，不出分
     return round(max(0.0, (1.0 - len(miss) / float(max(len(ref), 1))) * 100.0), 1)
 
 
@@ -349,7 +349,7 @@ def main():
         % (phoneme.get("相似度"), len(phoneme.get("差异") or [])), verbose=True)
     log("   节奏对比.json：节奏 %s ｜ 语调 %s ｜ 重音位置 %s"
         % (rhythm.get("节奏分"), rhythm.get("语调分"),
-           ((rhythm.get("重音_信号") or {}).get("原音频突出块") and "有" or "—")), verbose=True)
+           ((rhythm.get("重音_信号") or {}).get("原音频重读词") and "有" or "—")), verbose=True)
 
     log_step("计算分项分与综合分")
     stat = phoneme.get("对齐统计")
@@ -394,8 +394,8 @@ def main():
             out("   停顿：原音频 %s 处 / 我 %s 处"
                 % (ps.get("原音频处数", "—"), ps.get("我的处数", "—")))
         if st:
-            out("   重音：突出块 原 %d / 我 %d（命中 %d ｜ 漏 %d ｜ 多 %d）"
-                % (len(st.get("原音频突出块") or []), len(st.get("我的突出块") or []),
+            out("   重音：重读词 原 %d / 我 %d（命中 %d ｜ 漏 %d ｜ 多 %d）"
+                % (len(st.get("原音频重读词") or []), len(st.get("我的重读词") or []),
                    len(st.get("命中") or []), len(st.get("漏（原音频有）") or []),
                    len(st.get("多（我的）") or [])))
 
@@ -768,8 +768,8 @@ def write_report(overall, parts, phoneme, rhythm):
         else:
             L.append("    停顿：（数据缺失）")
         if st:
-            L.append("    重音：原音频突出 %d 块  |  你 %d 块  |  命中 %d  |  漏 %d  |  多 %d"
-                     % (len(st.get("原音频突出块") or []), len(st.get("我的突出块") or []),
+            L.append("    重音：原音频重读 %d 词  |  你 %d 词  |  命中 %d  |  漏 %d  |  多 %d"
+                     % (len(st.get("原音频重读词") or []), len(st.get("我的重读词") or []),
                         len(st.get("命中") or []), len(st.get("漏（原音频有）") or []),
                         len(st.get("多（我的）") or [])))
         # 语调：阶段 5 起降级为"仅可视化"，不出分

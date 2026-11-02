@@ -1,14 +1,17 @@
 @echo off
 chcp 65001 >nul
-cd /d %~dp0
 setlocal enabledelayedexpansion
+
+rem 本脚本放在 tmp\ 下，%~dp0 指向 tmp\；真正的 .venv 在上一层（项目根）。
+rem 用 ROOT 指回上一层，所有路径以 ROOT 为基准。
+set "ROOT=%~dp0..\"
 
 rem ============================================================
 rem  还原度测试 - 一键装依赖
 rem
 rem  What it does:
 rem    1. locate a Python (3.11+)
-rem    2. create an isolated .venv in this folder
+rem    2. create an isolated .venv in the project root (上一层)
 rem    3. install dependencies (torch from official PyPI)
 rem    4. self-check: can we import the key libraries
 rem
@@ -58,18 +61,18 @@ echo [1/4] Python found:
 echo.
 
 rem ---------- 2. create venv ----------
-if exist "%~dp0.venv\Scripts\python.exe" (
+if exist "%ROOT%.venv\Scripts\python.exe" (
     echo [2/4] .venv already exists, skipping creation.
 ) else (
     echo [2/4] creating .venv ^(about 30 seconds^) ...
-    "%PYEXE%" -m venv .venv
+    "%PYEXE%" -m venv "%ROOT%.venv"
     if errorlevel 1 (
         echo [ERROR] failed to create .venv
         pause
         exit /b 1
     )
 )
-set "VPY=%~dp0.venv\Scripts\python.exe"
+set "VPY=%ROOT%.venv\Scripts\python.exe"
 if not exist "%VPY%" (
     echo [ERROR] not found: %VPY%
     pause

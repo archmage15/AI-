@@ -769,26 +769,20 @@ def main():
                           "我的时长": cr.block_span(bm[i])})
     # 节奏分：把所有已读句的词块对合成一次 score_blocks（归一化+幂平均，同单句口径）
     items, rhythm_score = cr.score_blocks(pairs) if pairs else ([], 0.0)
-    # 重音：两侧各自邻域法（整段已读部分当一个整体，不分角色，同单句口径），再比对集合
-    feats_r = cr.block_signal_features(env_r, f0_r, blocks_r_all)
-    feats_m = cr.block_signal_features(env_m, f0_m, blocks_m_all)
-    for i, b in enumerate(blocks_r_all):
-        feats_r[i]["词"] = b["词"]
-    for i, b in enumerate(blocks_m_all):
-        feats_m[i]["词"] = b["词"]
-    marked_r, detail_r = (cr.mark_stress_neighborhood(feats_r, blocks_r_all, cr.NEIGH_R,
-                                                      cr.NEIGH_K)
-                          if blocks_r_all else ([], []))
-    marked_m, detail_m = (cr.mark_stress_neighborhood(feats_m, blocks_m_all, cr.NEIGH_R,
-                                                      cr.NEIGH_K)
-                          if blocks_m_all else ([], []))
+    # 重音：emphases 找重读词（2026-11-02 大法师拍板，替代邻域法）
+    import emphases_stress as es
+    _ref_wave = cp.load_mono(REF_FILE)  # emphases 需要原音频波形（缓存里没存波形）
+    marked_r, scores_r = (es.stress_marks(_ref_wave, cp.SR, blocks_r_all)
+                          if blocks_r_all else ([], np.zeros(0)))
+    marked_m, scores_m = (es.stress_marks(_my_wave, cp.SR, blocks_m_all)
+                          if blocks_m_all else ([], np.zeros(0)))
     miss_s = sorted(set(marked_r) - set(marked_m))
     extra_s = sorted(set(marked_m) - set(marked_r))
     hit_s = sorted(set(marked_r) & set(marked_m))
     ref_prom = len(marked_r)
     stress_pos = (round(max(0.0, (1.0 - len(miss_s) / float(max(ref_prom, 1))) * 100.0), 1)
                   if ref_prom else None)
-    log("   节奏分 %.1f ｜ 重音位置 %s（原突出 %d / 我突出 %d / 漏 %d / 多 %d）"
+    log("   节奏分 %.1f ｜ 重音位置 %s（原重读 %d / 我重读 %d / 漏 %d / 多 %d）"
         % (rhythm_score, stress_pos, ref_prom, len(marked_m), len(miss_s), len(extra_s)))
 
     # ---- 画图（复用 compare_rhythm 的绘图函数；不画就会留下上一次的旧图）----
@@ -832,26 +826,39 @@ def main():
 
     out("")
     out("=" * 62)
-    out("   重音：先看两侧每块的判定依据，再看纠错结论")
+    out("   重音（emphases）：每个词的重读分数 + 纠错结论")
     out("=" * 62)
     _nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r_all)}
     _nm = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_m_all)}
-    if detail_r or detail_m:
-        for line in cr.render_stress_detail(detail_r, "原音频", miss=miss_s):
-            out(line)
+    if blocks_r_all or blocks_m_all:
+        out("   【原音频】共 %d 词，重读 %d 词 ｜【我的模仿】共 %d 词，重读 %d 词"
+            % (len(blocks_r_all), len(marked_r), len(blocks_m_all), len(marked_m)))
         out("")
-        for line in cr.render_stress_detail(detail_m, "我的模仿", extra=extra_s):
-            out(line)
+        out("   序号  词               原音频分   模仿分   标记")
+        for i in range(max(len(blocks_r_all), len(blocks_m_all))):
+            no = i + 1
+            word = _nr.get(no, _nm.get(no, "?"))
+            sr_v = scores_r[i] if i < len(scores_r) else None
+            sm_v = scores_m[i] if i < len(scores_m) else None
+            flag = "M" if no in miss_s else ("X" if no in extra_s
+                                             else ("★" if no in marked_r else "○"))
+            out("   %-4d %-14s %8s %8s   %s" % (no, word,
+                  ("%.3f" % sr_v) if sr_v is not None else "-",
+                  ("%.3f" % sm_v) if sm_v is not None else "-", flag))
+        out("")
+        out("   标记：★ 两侧都重读  ○ 都不重读  M 原重读你漏了  X 你多读的")
         out("")
         out("纠错结论：")
         for line in cr.render_stress_verdict(_nr, _nm, marked_r, marked_m):
             out(line)
         out("")
-        out("重点词清单（照这个单子练，不用自己从上面表格里找）：")
-        for line in cr.render_focus_words(detail_r, detail_m, _nr, _nm):
-            out(line)
-        for line in cr.render_extra_words(detail_r, detail_m, _nr, _nm):
-            out(line)
+        out("重点词清单（照这个单子练）：")
+        if miss_s:
+            out("   漏读重音（该重读没重读）：%s" % "、".join(_nr[i] for i in miss_s))
+        if extra_s:
+            out("   多读重音（不该重读却重读）：%s" % "、".join(_nm[i] for i in extra_s))
+        if not miss_s and not extra_s:
+            out("   （重音位置完全命中，无漏无多）")
     else:
         out("   （无已读句，无重音判定）")
 
@@ -967,19 +974,19 @@ def main():
             "词块时长": items,
         },
         "重音_信号": {
-            "方法": "邻域法（三路投票：音高半音/响度÷中位/时长÷中位；局部最大且落差≥K·σ）",
-            "分组": "角色",
-            "半径R": cr.NEIGH_R, "阈值K": cr.NEIGH_K,
-            "原音频突出块": [{"序号": i, "块": nr.get(i, "?")} for i in marked_r],
-            "我的突出块": [{"序号": i, "块": nm.get(i, "?")} for i in marked_m],
-            "漏（原音频有）": [{"序号": i, "块": nr.get(i, "?")} for i in miss_s],
-            "多（我的）": [{"序号": i, "块": nm.get(i, "?")} for i in extra_s],
-            "命中": [{"序号": i, "块": nr.get(i, "?")} for i in hit_s],
-            "逐块明细": {"原音频": detail_r, "我的": detail_m},
+            "方法": "emphases（神经网络 prominence 模型，真人母语者标注训练）",
+            "阈值": es.THRESHOLD,
+            "原音频重读词": [{"序号": i, "词": nr.get(i, "?")} for i in marked_r],
+            "我的重读词": [{"序号": i, "词": nm.get(i, "?")} for i in marked_m],
+            "漏（原音频有）": [{"序号": i, "词": nr.get(i, "?")} for i in miss_s],
+            "多（我的）": [{"序号": i, "词": nm.get(i, "?")} for i in extra_s],
+            "命中": [{"序号": i, "词": nr.get(i, "?")} for i in hit_s],
+            "逐词分数": {"原音频": [round(float(s), 4) for s in scores_r],
+                         "我的": [round(float(s), 4) for s in scores_m]},
             "块序号到句号": block_sent_map,
             "按句重音": build_per_sentence_stress(
                 block_sent_map, marked_r, marked_m, nr, nm, sent_results),
-            "说明": "长音频模式：已读部分当一个整体做邻域统计（同单句口径）",
+            "说明": "长音频模式：emphases 逐词 prominence 分数，> 阈值判重读",
         },
         "词表": {"原音频": [{"词": b["词"], "start_ms": b["start_ms"], "end_ms": b["end_ms"],
                              "连读": b.get("连读", False), "角色": b.get("角色")}
@@ -1120,30 +1127,40 @@ def main():
             L.append("   句%d：%s" % (r["句号"], r["文本"]))
     L.append("")
     L.append("-" * 60)
-    L.append("六、重音：先看两侧每块的判定依据，再看纠错结论")
+    L.append("六、重音（emphases）：每个词的重读分数 + 纠错结论")
     L.append("-" * 60)
     L.append("")
     _nr = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_r_all)}
     _nm = {i + 1: "+".join(b["词"]) for i, b in enumerate(blocks_m_all)}
-    L.append("判定口径：三路（音高半音 / 响度÷中位 / 时长÷中位）各自按角色组归一，")
-    L.append("        每块与【同角色前后邻块】中位数比，落差 ≥ %.1fσ 且为局部极值 → 该路投突出；"
-             % cr.NEIGH_K)
-    L.append("        至少 2 路投出才算这块突出（够 2 路即取半数向上取整）。")
-    L.append("        ⚠ 音高路【双向】（升调/降调都算 prominence，因为英语重音可由降调实现）；")
-    L.append("          响度/时长路【单向】（只有「更响/更长」算突出，轻/短是弱化不是重读）。")
+    L.append("判定口径：emphases 神经网络逐词 prominence 分数（> %.2f 判重读）。"
+             % es.THRESHOLD)
     L.append("")
-    if detail_r:
-        L.extend(cr.render_stress_detail(detail_r, "原音频", miss=miss_s))
+    if blocks_r_all or blocks_m_all:
+        L.append("  【原音频】%d 词，重读 %d 词 ｜【我的模仿】%d 词，重读 %d 词"
+                 % (len(blocks_r_all), len(marked_r), len(blocks_m_all), len(marked_m)))
         L.append("")
-    if detail_m:
-        L.extend(cr.render_stress_detail(detail_m, "我的模仿", extra=extra_s))
+        for i in range(max(len(blocks_r_all), len(blocks_m_all))):
+            no = i + 1
+            word = _nr.get(no, _nm.get(no, "?"))
+            sr_v = scores_r[i] if i < len(scores_r) else None
+            sm_v = scores_m[i] if i < len(scores_m) else None
+            flag = "M" if no in miss_s else ("X" if no in extra_s
+                                             else ("★" if no in marked_r else "○"))
+            L.append("    %-4d %-14s %8s %8s   %s" % (no, word,
+                      ("%.3f" % sr_v) if sr_v is not None else "-",
+                      ("%.3f" % sm_v) if sm_v is not None else "-", flag))
+        L.append("    标记：★ 两侧都重读  ○ 都不重读  M 原重读你漏了  X 你多读的")
         L.append("")
         L.append("纠错结论：")
         L.extend(cr.render_stress_verdict(_nr, _nm, marked_r, marked_m))
         L.append("")
-        L.append("重点词清单（照这个单子练，不用自己从上面表格里找）：")
-        L.extend(cr.render_focus_words(detail_r, detail_m, _nr, _nm))
-        L.extend(cr.render_extra_words(detail_r, detail_m, _nr, _nm))
+        L.append("重点词清单（照这个单子练）：")
+        if miss_s:
+            L.append("   漏读重音（该重读没重读）：%s" % "、".join(_nr[i] for i in miss_s))
+        if extra_s:
+            L.append("   多读重音（不该重读却重读）：%s" % "、".join(_nm[i] for i in extra_s))
+        if not miss_s and not extra_s:
+            L.append("   （重音位置完全命中，无漏无多）")
     else:
         L.append("   （无已读句，无重音判定）")
     L.append("")

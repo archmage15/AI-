@@ -35,12 +35,12 @@ rem set LOG_VERBOSE=1
 rem set LOG_OFF=1
 
 set "PYEXE="
-set "CAND=%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
-if exist "%CAND%" set "PYEXE=%CAND%"
-if not defined PYEXE if exist "%~dp0.venv\Scripts\python.exe" set "PYEXE=%~dp0.venv\Scripts\python.exe"
+if exist "%~dp0.venv\Scripts\python.exe" set "PYEXE=%~dp0.venv\Scripts\python.exe"
+if not defined PYEXE set "CAND=%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
+if not defined PYEXE if exist "%CAND%" set "PYEXE=%CAND%"
 
 if not defined PYEXE (
-    echo [ERROR] No usable Python found. Run install_deps.bat first.
+    echo [ERROR] No usable Python found. Run tmp\install_deps.bat first.
     pause
     exit /b 1
 )
